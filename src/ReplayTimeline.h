@@ -9,14 +9,12 @@
 #include <tuple>
 #include <vector>
 
+#include "BreakpointCondition.h"
 #include "Registers.h"
 #include "ReplaySession.h"
 #include "TraceFrame.h"
 
-enum RunDirection {
-  RUN_FORWARD,
-  RUN_BACKWARD
-};
+enum RunDirection { RUN_FORWARD, RUN_BACKWARD };
 
 /**
  * This class manages a set of ReplaySessions corresponding to different points
@@ -32,6 +30,8 @@ public:
                  const ReplaySession::Flags& session_flags);
   ReplayTimeline() : breakpoints_applied(false) {}
   ~ReplayTimeline();
+
+  bool is_running() const { return current != nullptr; }
 
   /**
    * An estimate of how much progress a session has made. This should roughly
@@ -63,6 +63,8 @@ public:
      */
     const Registers& regs() const { return ptr->regs; }
     const ExtraRegisters& extra_regs() const { return ptr->extra_regs; }
+
+    TraceFrame::Time time() const { return ptr->key.trace_time; }
 
   private:
     friend class ReplayTimeline;
@@ -121,14 +123,36 @@ public:
   // Add/remove breakpoints and watchpoints. Use these APIs instead
   // of operating on the task directly, so that ReplayTimeline can track
   // breakpoints and automatically move them across sessions as necessary.
-  bool add_breakpoint(Task* t, remote_ptr<uint8_t> addr);
-  void remove_breakpoint(Task* t, remote_ptr<uint8_t> addr);
+  // Only one breakpoint for a given address space/addr combination can be set;
+  // setting another for the same address space/addr will replace the first.
+  // Likewise only one watchpoint for a given task/addr/num_bytes/type can be
+  // set. gdb expects that setting two breakpoints on the same address and then
+  // removing one removes both.
+  bool add_breakpoint(Task* t, remote_code_ptr addr,
+                      std::unique_ptr<BreakpointCondition> condition = nullptr);
+  // You can't remove a breakpoint with a specific condition, so don't
+  // place multiple breakpoints with conditions on the same location.
+  void remove_breakpoint(Task* t, remote_code_ptr addr);
   bool add_watchpoint(Task* t, remote_ptr<void> addr, size_t num_bytes,
-                      WatchType type);
+                      WatchType type,
+                      std::unique_ptr<BreakpointCondition> condition = nullptr);
+  // You can't remove a watchpoint with a specific condition, so don't
+  // place multiple breakpoints with conditions on the same location.
   void remove_watchpoint(Task* t, remote_ptr<void> addr, size_t num_bytes,
                          WatchType type);
   void remove_breakpoints_and_watchpoints();
-  bool has_breakpoint_at_address(Task* t, remote_ptr<uint8_t> addr);
+  bool has_breakpoint_at_address(Task* t, remote_code_ptr addr);
+  bool has_watchpoint_at_address(Task* t, remote_ptr<void> addr,
+                                 size_t num_bytes, WatchType type);
+
+  /**
+   * Ensure that reverse execution never proceeds into an event before
+   * |event|. Reverse execution will stop with a |task_exit| break status when
+   * at the beginning of this event.
+   */
+  void set_reverse_execution_barrier_event(TraceFrame::Time event) {
+    reverse_execution_barrier_event = event;
+  }
 
   // State-changing APIs. These may alter state associated with
   // current_session().
@@ -155,7 +179,7 @@ public:
   void seek_to_mark(const Mark& mark);
 
   /**
-   * Replay 'current' forwards.
+   * Replay 'current'.
    * If there is a breakpoint at the current task's current ip(), then
    * when running forward we will immediately break at the breakpoint. When
    * running backward we will ignore the initial "hit" of the breakpoint ---
@@ -164,15 +188,24 @@ public:
    * then running forward will immediately break at the breakpoint, but
    * running backward will ignore the initial "hit" of the breakpoint; this is
    * what gdb expects.
+   *
+   * replay_step_forward only does one replay step. That means we'll only
+   * execute code in current_session().current_task().
    */
-  ReplayResult replay_step(RunCommand command = RUN_CONTINUE,
-                           RunDirection direction = RUN_FORWARD,
-                           TraceFrame::Time stop_at_time = 0);
+  ReplayResult replay_step_forward(RunCommand command,
+                                   TraceFrame::Time stop_at_time);
+
+  ReplayResult reverse_continue(const std::function<bool(Task* t)>& stop_filter,
+                                const std::function<bool()>& interrupt_check);
+  ReplayResult reverse_singlestep(
+      const TaskUid& tuid, Ticks tuid_ticks,
+      const std::function<bool(Task* t)>& stop_filter,
+      const std::function<bool()>& interrupt_check);
 
   /**
    * Try to identify an existing Mark which is known to be one singlestep
    * before 'from', and for which we know singlestepping to 'from' would
-   * not trigger no break statuses other than "singlestep_complete".
+   * trigger no break statuses other than "singlestep_complete".
    * If we can't, return a null Mark.
    * Will only return a Mark for the same executing task as 'from', which
    * must be 't'.
@@ -198,6 +231,16 @@ public:
      */
     EXPECT_SHORT_REVERSE_EXECUTION
   };
+
+  /**
+   * We track the set of breakpoints/watchpoints requested by the client.
+   * When we switch to a new ReplaySession, these need to be reapplied before
+   * replaying that session, but we do this lazily.
+   * apply_breakpoints_and_watchpoints() forces the breakpoints/watchpoints
+   * to be applied to the current session.
+   * Our checkpoints never have breakpoints applied.
+   */
+  void apply_breakpoints_and_watchpoints();
 
 private:
   /**
@@ -226,6 +269,9 @@ private:
       }
       return step_key < other.step_key;
     }
+    bool operator>(const MarkKey& other) const { return other < *this; }
+    bool operator>=(const MarkKey& other) const { return !(*this < other); }
+    bool operator<=(const MarkKey& other) const { return !(other < *this); }
     bool operator==(const MarkKey& other) const {
       return trace_time == other.trace_time && ticks == other.ticks &&
              step_key == other.step_key;
@@ -241,7 +287,7 @@ private:
     ProtoMark(const MarkKey& key, Task* t)
         : key(key), regs(t->regs()), return_addresses(t->return_addresses()) {}
 
-    bool equal_states(Task* t) const;
+    bool equal_states(ReplaySession& session) const;
 
     MarkKey key;
     Registers regs;
@@ -254,11 +300,14 @@ private:
    * record the ordering in the ReplayTimeline.
    */
   struct InternalMark {
-    InternalMark(ReplayTimeline* owner, Task* t, const MarkKey& key)
+    InternalMark(ReplayTimeline* owner, ReplaySession& session,
+                 const MarkKey& key)
         : owner(owner),
           key(key),
+          ticks_at_event_start(session.ticks_at_start_of_current_event()),
           checkpoint_refcount(0),
           singlestep_to_next_mark_no_signal(false) {
+      Task* t = session.current_task();
       if (t) {
         regs = t->regs();
         return_addresses = t->return_addresses();
@@ -269,7 +318,7 @@ private:
 
     bool operator<(const std::shared_ptr<InternalMark> other);
 
-    bool equal_states(Task* t) const;
+    bool equal_states(ReplaySession& session) const;
 
     ReplayTimeline* owner;
     MarkKey key;
@@ -277,6 +326,7 @@ private:
     ExtraRegisters extra_regs;
     ReturnAddressList return_addresses;
     ReplaySession::shr_ptr checkpoint;
+    Ticks ticks_at_event_start;
     uint32_t checkpoint_refcount;
     // The next InternalMark in the mark vector is the result of singlestepping
     // from this mark *and* no signal is reported in the break_status.
@@ -286,15 +336,6 @@ private:
   friend std::ostream& operator<<(std::ostream& s, const InternalMark& o);
   friend std::ostream& operator<<(std::ostream& s, const ProtoMark& o);
 
-  /**
-   * We track the set of breakpoints/watchpoints requested by the client.
-   * When we switch to a new ReplaySession, these need to be reapplied before
-   * replaying that session, but we do this lazily.
-   * apply_breakpoints_and_watchpoints() forces the breakpoints/watchpoints
-   * to be applied to the current session.
-   * Our checkpoints never have breakpoints applied.
-   */
-  void apply_breakpoints_and_watchpoints();
   /**
    * unapply_breakpoints_and_watchpoints() forces the breakpoints/watchpoints
    * to not be applied to the current session. Use this when we need to
@@ -317,14 +358,39 @@ private:
   std::shared_ptr<InternalMark> current_mark();
   void remove_mark_with_checkpoint(const MarkKey& key);
   void seek_to_before_key(const MarkKey& key);
-  ReplayResult replay_step_to_mark(const Mark& mark);
+  enum ForceProgress { FORCE_PROGRESS, DONT_FORCE_PROGRESS };
+  // Run forward towards the midpoint of the current position and |end|.
+  // Must stop before we reach |end|.
+  // Returns false if we made no progress.
+  bool run_forward_to_intermediate_point(const Mark& end, ForceProgress force);
+  struct ReplayStepToMarkStrategy {
+    ReplayStepToMarkStrategy() : singlesteps_to_perform(0) {}
+    ReplaySession::StepConstraints setup_step_constraints();
+    uint32_t singlesteps_to_perform;
+  };
+  void update_strategy_and_fix_watchpoint_quirk(
+      ReplayStepToMarkStrategy& strategy,
+      const ReplaySession::StepConstraints& constraints, ReplayResult& result,
+      const ProtoMark& before);
+  // Take a single replay step towards |mark|. Stop before or at |mark|, and
+  // stop if any breakpoint/watchpoint/signal is hit.
+  // Maintain current strategy state in |strategy|. Passing the same
+  // |strategy| object to consecutive replay_step_to_mark invocations helps
+  // optimize performance.
+  ReplayResult replay_step_to_mark(const Mark& mark,
+                                   ReplayStepToMarkStrategy& strategy);
   ReplayResult singlestep_with_breakpoints_disabled();
-  void fix_watchpoint_coalescing_quirk(ReplayResult& result,
+  bool fix_watchpoint_coalescing_quirk(ReplayResult& result,
                                        const ProtoMark& before);
   Mark find_singlestep_before(const Mark& mark);
+  bool is_start_of_reverse_execution_barrier_event();
 
-  ReplayResult reverse_continue();
-  ReplayResult reverse_singlestep(const Mark& origin, const TaskUid& tuid);
+  void update_observable_break_status(ReplayTimeline::Mark& now,
+                                      const ReplayResult& result);
+  ReplayResult reverse_singlestep(
+      const Mark& origin, const TaskUid& step_tuid, Ticks step_ticks,
+      const std::function<bool(Task* t)>& stop_filter,
+      const std::function<bool()>& interrupt_check);
 
   // Reasonably fast since it just relies on checking the mark map.
   static bool less_than(const Mark& m1, const Mark& m2);
@@ -351,6 +417,12 @@ private:
   void discard_future_reverse_exec_checkpoints();
 
   Mark set_short_checkpoint();
+
+  /**
+   * If result.break_status hit watchpoints or breakpoints, evaluate their
+   * conditions and clear the break_status flags if the conditions don't hold.
+   */
+  void evaluate_conditions(ReplayResult& result);
 
   ReplaySession::Flags session_flags;
 
@@ -381,10 +453,13 @@ private:
    */
   std::map<MarkKey, uint32_t> marks_with_checkpoints;
 
-  std::multiset<std::pair<AddressSpaceUid, remote_ptr<uint8_t> > > breakpoints;
-  std::multiset<std::tuple<AddressSpaceUid, remote_ptr<void>, size_t,
-                           WatchType> > watchpoints;
+  std::set<std::tuple<AddressSpaceUid, remote_code_ptr,
+                      std::unique_ptr<BreakpointCondition> > > breakpoints;
+  std::set<std::tuple<AddressSpaceUid, remote_ptr<void>, size_t, WatchType,
+                      std::unique_ptr<BreakpointCondition> > > watchpoints;
   bool breakpoints_applied;
+
+  TraceFrame::Time reverse_execution_barrier_event;
 
   /**
    * Checkpoints used to accelerate reverse execution.

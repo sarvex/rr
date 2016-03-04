@@ -2,6 +2,7 @@
 
 #include "main.h"
 
+#include <limits.h>
 #include <linux/version.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +16,9 @@
 #include "RecordCommand.h"
 
 using namespace std;
+
+// Show version and quit.
+static bool show_version = false;
 
 void assert_prerequisites(bool use_syscall_buffer) {
   struct utsname uname_buf;
@@ -78,7 +82,7 @@ void check_performance_settings() {
             "governor\n"
             "    by running the following commands:\n"
             "\n"
-            "    $ sudo yum install kernel-tools\n"
+            "    $ sudo dnf install kernel-tools\n"
             "    $ sudo cpupower frequency-set -g performance\n"
             "\n",
             governor);
@@ -88,7 +92,10 @@ void check_performance_settings() {
   }
 }
 
+void print_version(FILE* out) { fprintf(out, "rr version %s\n", RR_VERSION); }
+
 void print_usage(FILE* out) {
+  print_version(out);
   fputs("Usage:\n", out);
   Command::print_help_all(out);
   fputs(
@@ -99,7 +106,9 @@ void print_usage(FILE* out) {
       "detection\n"
       "                             says otherwise.  NAME should be a string "
       "like\n"
-      "                             'Ivy Bridge'.\n"
+      "                             'Ivy Bridge'. Note that rr will not work "
+      "with\n"
+      "                             Intel Merom or Penryn microarchitectures.\n"
       "  -C, --checksum={on-syscalls,on-all-events}|FROM_TIME\n"
       "                             compute and store (during recording) or\n"
       "                             read and verify (during replay) checksums\n"
@@ -125,10 +134,11 @@ void print_usage(FILE* out) {
       "/proc/maps\n"
       "  -E, --fatal-errors         any warning or error that is printed is\n"
       "                             treated as fatal\n"
-      "  -M, --mark-stdio           mark stdio writes with [rr.<EVENT-NO>],\n"
-      "                             where EVENT-NO is the global trace time "
-      "at\n"
-      "                             which the write occures.\n"
+      "  -M, --mark-stdio           mark stdio writes with [rr <PID> <EV>]\n"
+      "                             where EV is the global trace time at\n"
+      "                             which the write occurs and PID is the pid\n"
+      "                             of the process it occurs in.\n"
+      "  -N, --version              print the version number and exit\n"
       "  -S, --suppress-environment-warnings\n"
       "                             suppress warnings about issues in the\n"
       "                             environment that rr has no control over\n"
@@ -142,7 +152,9 @@ void print_usage(FILE* out) {
 
 static void init_random() {
   // Not very good, but good enough for our non-security-sensitive needs.
-  srandom(time(nullptr) ^ getpid());
+  int key = time(nullptr) ^ getpid();
+  srandom(key);
+  srand(key);
 }
 
 bool parse_global_option(std::vector<std::string>& args) {
@@ -157,7 +169,8 @@ bool parse_global_option(std::vector<std::string>& args) {
     { 'M', "mark-stdio", NO_PARAMETER },
     { 'S', "suppress-environment-warnings", NO_PARAMETER },
     { 'E', "fatal-errors", NO_PARAMETER },
-    { 'V', "verbose", NO_PARAMETER }
+    { 'V', "verbose", NO_PARAMETER },
+    { 'N', "version", NO_PARAMETER }
   };
 
   ParsedOption opt;
@@ -206,6 +219,9 @@ bool parse_global_option(std::vector<std::string>& args) {
     case 'V':
       flags.verbose = true;
       break;
+    case 'N':
+      show_version = true;
+      break;
     default:
       assert(0 && "Invalid flag");
   }
@@ -221,6 +237,11 @@ int main(int argc, char* argv[]) {
   }
 
   while (parse_global_option(args)) {
+  }
+
+  if (show_version) {
+    print_version(stdout);
+    return 0;
   }
 
   if (args.size() == 0) {

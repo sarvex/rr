@@ -15,11 +15,11 @@ struct InstructionBuf {
   int code_buf_len;
 };
 
-static InstructionBuf read_instruction(Task* t, remote_ptr<uint8_t> ip) {
+static InstructionBuf read_instruction(Task* t, remote_code_ptr ip) {
   InstructionBuf result;
   result.arch = t->arch();
-  result.code_buf_len =
-      (int)t->read_bytes_fallible(ip, sizeof(result.code_buf), result.code_buf);
+  result.code_buf_len = (int)t->read_bytes_fallible(
+      ip.to_data_ptr<uint8_t>(), sizeof(result.code_buf), result.code_buf);
   return result;
 }
 
@@ -154,9 +154,9 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
                                       const vector<const Registers*>& states) {
   assert(how == RESUME_SINGLESTEP || how == RESUME_SYSEMU_SINGLESTEP);
 
-  remote_ptr<uint8_t> ip = t->ip();
+  remote_code_ptr ip = t->ip();
 
-  t->resume_execution(how, RESUME_WAIT);
+  t->resume_execution(how, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
   if (t->pending_sig() != SIGTRAP) {
     // we might have stepped into a system call...
     return false;
@@ -165,11 +165,11 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
   if (t->ip() != ip) {
     return false;
   }
-  if (t->vm()->get_breakpoint_type_at_addr(ip) != TRAP_NONE) {
+  if (t->vm()->get_breakpoint_type_at_addr(ip) != BKPT_NONE) {
     // breakpoint must have fired
     return false;
   }
-  if (t->debug_status() & DS_WATCHPOINT_ANY) {
+  if (t->vm()->notify_watchpoint_fired(t->debug_status())) {
     // watchpoint fired
     return false;
   }
@@ -187,6 +187,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
   if (!decode_x86_string_instruction(instruction_buf, &decoded)) {
     return false;
   }
+
+  remote_code_ptr limit_ip = ip + decoded.length;
 
   // At this point we can be sure the instruction didn't trigger a syscall,
   // so we no longer care about the value of |how|.
@@ -214,6 +216,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
 
     uintptr_t cur_cx = t->regs().cx();
     if (cur_cx == 0) {
+      // Fake singlestep status for trap diagnosis
+      t->set_debug_status(DS_SINGLESTEP);
       // This instruction will be skipped entirely.
       return did_execute;
     }
@@ -238,7 +242,7 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
           continue;
         }
         iterations = min(iterations, cur_cx - dest_cx - 1);
-      } else if (state->ip() == ip + decoded.length) {
+      } else if (state->ip() == limit_ip) {
         uintptr_t dest_cx = state->cx();
         if (dest_cx >= cur_cx) {
           // This can't be reached in the current loop.
@@ -271,6 +275,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
     }
 
     if (iterations == 0) {
+      // Fake singlestep status for trap diagnosis
+      t->set_debug_status(DS_SINGLESTEP);
       return did_execute;
     }
 
@@ -295,31 +301,36 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
       LOG(debug) << "Set x86-string fast-forward watchpoint at " << watch_di;
       bool ok = t->vm()->add_watchpoint(watch_di, 1, WATCH_READWRITE);
       ASSERT(t, ok) << "Can't even handle one watchpoint???";
-      ok = t->vm()->add_breakpoint(ip + decoded.length, TRAP_BKPT_INTERNAL);
+      ok = t->vm()->add_breakpoint(limit_ip, BKPT_INTERNAL);
       ASSERT(t, ok) << "Failed to add breakpoint";
 
-      t->resume_execution(RESUME_CONT, RESUME_WAIT);
+      t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
       did_execute = true;
       ASSERT(t, t->pending_sig() == SIGTRAP);
       // Grab debug_status before restoring watchpoints, since the latter
       // clears the debug status
-      auto debug_status = t->consume_debug_status();
-      t->vm()->remove_breakpoint(ip + decoded.length, TRAP_BKPT_INTERNAL);
+      bool triggered_watchpoint =
+          t->vm()->notify_watchpoint_fired(t->debug_status());
+      t->vm()->remove_breakpoint(limit_ip, BKPT_INTERNAL);
       t->vm()->restore_watchpoints();
 
       iterations -= cur_cx - t->regs().cx();
 
-      if (!(debug_status & DS_WATCHPOINT_ANY)) {
+      if (!triggered_watchpoint) {
         // watchpoint didn't fire. We must have exited the loop early and
         // hit the breakpoint. IP will be after the breakpoint instruction.
-        ASSERT(t, t->ip() == ip + decoded.length + 1 && decoded.modifies_flags);
+        ASSERT(t,
+               t->ip() == limit_ip.increment_by_bkpt_insn_length(t->arch()) &&
+                   decoded.modifies_flags);
         // Undo the execution of the breakpoint instruction.
         Registers tmp = t->regs();
-        tmp.set_ip(ip + decoded.length);
+        tmp.set_ip(limit_ip);
         t->set_regs(tmp);
       } else {
         watch_offset = decoded.operand_size * (iterations - 1);
         if (watch_offset > BYTES_COALESCED) {
+          // Fake singlestep status for trap diagnosis
+          t->set_debug_status(DS_SINGLESTEP);
           // We fired the watchpoint too early, perhaps because reads through SI
           // triggered it. Let's just bail out now; better for the caller to
           // retry
@@ -337,20 +348,18 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
 
     // Singlestep through the remaining iterations.
     while (iterations > 0 && t->ip() == ip) {
-      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT);
+      t->resume_execution(RESUME_SINGLESTEP, RESUME_WAIT,
+                          RESUME_UNLIMITED_TICKS);
       did_execute = true;
       ASSERT(t, t->pending_sig() == SIGTRAP);
-      auto debug_status = t->consume_debug_status();
-      // No watchpoints should have fired. If we exited the loop, we should
-      // still not have triggered any EXEC watchpoints since we haven't
-      // executed any instructions outside the loop.
-      ASSERT(t, !(debug_status & DS_WATCHPOINT_ANY));
+      // Watchpoints can fire spuriously because configure_watch_registers
+      // can increase the size of the watched area to conserve watch registers.
       --iterations;
     }
 
     if (t->ip() != ip) {
       // We exited the loop early due to flags being modified.
-      ASSERT(t, t->ip() == ip + decoded.length && decoded.modifies_flags);
+      ASSERT(t, t->ip() == limit_ip && decoded.modifies_flags);
       // String instructions that modify flags don't have non-register side
       // effects, so we can reset registers to effectively unwind the loop.
       // Then we try rerunning the loop again, adding this state as one to
@@ -364,7 +373,7 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
     } else {
       LOG(debug) << "x86-string fast-forward done; ip()==" << t->ip();
       // Fake singlestep status for trap diagnosis
-      t->replace_debug_status(DS_SINGLESTEP);
+      t->set_debug_status(DS_SINGLESTEP);
       return did_execute;
     }
   }
@@ -419,10 +428,11 @@ static int fallible_read_byte(Task* t, remote_ptr<uint8_t> ip) {
   return byte;
 }
 
-static bool is_string_instruction_at(Task* t, remote_ptr<uint8_t> ip) {
+static bool is_string_instruction_at(Task* t, remote_code_ptr ip) {
   bool found_rep = false;
+  remote_ptr<uint8_t> bare_ip = ip.to_data_ptr<uint8_t>();
   while (true) {
-    int byte = fallible_read_byte(t, ip);
+    int byte = fallible_read_byte(t, bare_ip);
     if (byte < 0) {
       return false;
     } else if (is_rep_prefix(byte)) {
@@ -432,19 +442,20 @@ static bool is_string_instruction_at(Task* t, remote_ptr<uint8_t> ip) {
     } else if (!is_ignorable_prefix(t, byte)) {
       return false;
     }
-    ++ip;
+    ++bare_ip;
   }
 }
 
-static bool is_string_instruction_before(Task* t, remote_ptr<uint8_t> ip) {
-  --ip;
-  int byte = fallible_read_byte(t, ip);
+static bool is_string_instruction_before(Task* t, remote_code_ptr ip) {
+  remote_ptr<uint8_t> bare_ip = ip.to_data_ptr<uint8_t>();
+  --bare_ip;
+  int byte = fallible_read_byte(t, bare_ip);
   if (byte < 0 || !is_string_instruction(byte)) {
     return false;
   }
   while (true) {
-    --ip;
-    int byte = fallible_read_byte(t, ip);
+    --bare_ip;
+    int byte = fallible_read_byte(t, bare_ip);
     if (byte < 0) {
       return false;
     } else if (is_rep_prefix(byte)) {

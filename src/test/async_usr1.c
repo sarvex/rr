@@ -15,8 +15,8 @@ static void breakpoint(void) {
   (void)break_here;
 }
 
-int main(int argc, char* argv[]) {
-  int dummy, i;
+int main(void) {
+  int dummy = 0, i;
 
   signal(SIGUSR1, handle_usr1);
 

@@ -4,7 +4,7 @@
 
 /* Make SIZE not a multiple of the page size, to ensure we handle that case.
    But make sure it's even, since we divide it by two. */
-#define SIZE ((16 * PAGE_SIZE) - 10)
+#define SIZE ((int)(16 * PAGE_SIZE) - 10)
 
 static int shmid;
 
@@ -24,7 +24,7 @@ static int run_child(void) {
   ALLOCATE_GUARD(ds, 'd');
   test_assert(0 == shmctl(shmid, IPC_STAT, ds));
   VERIFY_GUARD(ds);
-  test_assert(ds->shm_segsz == SIZE);
+  test_assert((int)ds->shm_segsz == SIZE);
   test_assert(ds->shm_cpid == getppid());
   test_assert(ds->shm_nattch == 0);
 
@@ -83,7 +83,7 @@ static int run_child(void) {
   return 0;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pid_t child;
   int status;
 

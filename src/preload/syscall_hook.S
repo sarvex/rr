@@ -1,3 +1,23 @@
+        /* This must match the numbers in X86SyscallStubMonkeypatch and
+           X64SyscallStubMonkeypatch */
+        .set _syscall_stack_adjust,256
+        /* This must exceed the maximum stack usage of the syscall hook and
+           its callees */
+        .set _stack_pad_size,2048
+
+        /* _syscall_hook_trampoline must be the first instruction defined
+           in this file, and _stub_buffer_end must be at the end of the last
+           instruction. */
+
+        .global _syscall_hook_trampoline
+        .hidden _syscall_hook_trampoline
+        .type _syscall_hook_trampoline, @function
+
+        .global _stub_buffer
+        .hidden _stub_buffer
+        .global _stub_buffer_end
+        .hidden _stub_buffer_end
+
 #if defined(__i386__)
 /**
  * Jump to this hook from |__kernel_vsyscall()|, to buffer syscalls that
@@ -9,11 +29,18 @@
  * us.
  */
         .text
-        .global _syscall_hook_trampoline
-        .hidden _syscall_hook_trampoline
-        .type _syscall_hook_trampoline, @function
+
 _syscall_hook_trampoline:
         .cfi_startproc
+
+        /* Force the stack to be extended to at least _stack_pad_size.
+           This forces any MAP_GROWSDOWN emulation to happen before we enter
+           the syscallbuf, which avoids having to reason about system calls
+           being recorded while we're in the middle of syscallbuf processing.
+           This must be the first instruction of _syscall_hook_trampoline so
+           that we can treat this one instruction as "not part of the
+           syscallbuf library". */
+        movb $0,-_stack_pad_size(%esp)
 
         /* Build a |struct syscall_info| by pushing all the syscall
          * args and the number onto the stack. */
@@ -97,15 +124,69 @@ _syscall_hook_trampoline_3d_01_f0_ff_ff:
 
 
 
+        .global _syscall_hook_trampoline_90_90_90
+        .hidden _syscall_hook_trampoline_90_90_90
+        .type _syscall_hook_trampoline_90_90_90, @function
+_syscall_hook_trampoline_90_90_90:
+        .cfi_startproc
+
+        jmp _syscall_hook_trampoline
+
+        .cfi_endproc
+        .size _syscall_hook_trampoline_90_90_90, .-_syscall_hook_trampoline_90_90_90
+
+
+
+_stub_buffer:
+        .rept 1000
+        /* Must match X86SyscallStubMonkeypatch. We reproduce it here so we
+           can build the correct CFI unwinding info, so gdb gives good stack
+           traces from inside the syscall hook code. */
+        .cfi_startproc
+        /* Save fake return address and old sp to the stack, for gdb to use
+           during stack unwinding. Addresses will be filled in by rr. */
+        movl   $0x12345678,-_syscall_stack_adjust(%esp)
+        /* Backtrace here will be invalid! */
+        mov    %esp,(-_syscall_stack_adjust+4)(%esp)
+        /* Backtrace here will be invalid! */
+        lea    -_syscall_stack_adjust(%esp),%esp
+        .cfi_rel_offset %esp,4
+        /* We won't be able to get complete stack traces inside the above
+           sequence, but that's not important. What's important is that at this
+           point:
+           * (%esp) contains a "return address" for this stub that points
+             back to the patch site.
+           * (%esp+4) contains the value of %esp that will hold at the
+             patch site, and we've emitted CFI data to indicate that.
+           This makes gdb treat the patch site as the caller of this stub,
+           even though no call actually happened. */
+        call  _stub_buffer /* FAKE, filled in by rr */
+        /* A backtrace here will be valid since for unwinding purposes we're
+           basically in the same state as before the call. */
+        lea    _syscall_stack_adjust(%esp),%esp
+        /* Backtrace here will be invalid! */
+        /* Jump to the return address we saved on the stack */
+        jmp    *(-_syscall_stack_adjust)(%esp)
+        .cfi_endproc
+        .endr
+_stub_buffer_end:
+
 #elif defined(__x86_64__)
         .text
 
-        .global _syscall_hook_trampoline
-        .hidden _syscall_hook_trampoline
-        .type _syscall_hook_trampoline, @function
         .p2align 4
 _syscall_hook_trampoline:
         .cfi_startproc
+
+        /* Force the stack to be extended to at least _stack_pad_size.
+           This forces any MAP_GROWSDOWN emulation to happen before we enter
+           the syscallbuf, which avoids having to reason about system calls
+           being recorded while we're in the middle of syscallbuf processing.
+           This must be the first instruction of _syscall_hook_trampoline so
+           that we can treat this one instruction as "not part of the
+           syscallbuf library". */
+        movb $0,-_stack_pad_size(%rsp)
+
         /* Build a |struct syscall_info| on the stack by pushing the arguments
            and syscall number. */
         pushq %r9
@@ -183,6 +264,21 @@ _syscall_hook_trampoline_48_3d_01_f0_ff_ff:
 
 
 
+        .global _syscall_hook_trampoline_48_3d_00_f0_ff_ff
+        .hidden _syscall_hook_trampoline_48_3d_00_f0_ff_ff
+        .type _syscall_hook_trampoline_48_3d_00_f0_ff_ff, @function
+_syscall_hook_trampoline_48_3d_00_f0_ff_ff:
+        .cfi_startproc
+
+        callq _syscall_hook_trampoline
+        cmpq $0xfffffffffffff000,%rax
+        ret
+
+        .cfi_endproc
+        .size _syscall_hook_trampoline_48_3d_00_f0_ff_ff, .-_syscall_hook_trampoline_48_3d_00_f0_ff_ff
+
+
+
         .global _syscall_hook_trampoline_48_8b_3c_24
         .hidden _syscall_hook_trampoline_48_8b_3c_24
         .type _syscall_hook_trampoline_48_8b_3c_24, @function
@@ -191,14 +287,36 @@ _syscall_hook_trampoline_48_8b_3c_24:
 
         callq _syscall_hook_trampoline
         /* The original instruction after the syscall is movq (%rsp),%rdi.
-           Because we pushed a return address before reaching this point,
-           to get the equivalent behavior we need to load the next word on the
-           stack. */
-        movq 8(%rsp),%rdi
+           Because we pushed a return address and shifted RSP down
+           before reaching this point, to get the equivalent behavior we
+           need to use this offset. */
+        movq (8 + _syscall_stack_adjust)(%rsp),%rdi
         ret
 
         .cfi_endproc
         .size _syscall_hook_trampoline_48_8b_3c_24, .-_syscall_hook_trampoline_48_8b_3c_24
+
+
+
+        .global _syscall_hook_trampoline_5a_5e_c3
+        .hidden _syscall_hook_trampoline_5a_5e_c3
+        .type _syscall_hook_trampoline_5a_5e_c3, @function
+_syscall_hook_trampoline_5a_5e_c3:
+        .cfi_startproc
+
+        callq _syscall_hook_trampoline
+        /* The original instructions after the syscall are
+           pop %rdx; pop %rsi; retq. */
+        pop %rdx /* Return address, ignored */
+        /* We're not returning to the dynamically generated stub, so
+           we need to fix the stack pointer ourselves. */
+        add $_syscall_stack_adjust,%rsp
+        pop %rdx
+        pop %rsi
+        ret
+
+        .cfi_endproc
+        .size _syscall_hook_trampoline_5a_5e_c3, .-_syscall_hook_trampoline_5a_5e_c3
 
 
 
@@ -212,6 +330,43 @@ _syscall_hook_trampoline_90_90_90:
 
         .cfi_endproc
         .size _syscall_hook_trampoline_90_90_90, .-_syscall_hook_trampoline_90_90_90
+
+
+_stub_buffer:
+        .rept 1000
+        /* Must match X64SyscallStubMonkeypatch. We reproduce it here so we
+           can build the correct CFI unwinding info, so gdb gives good stack
+           traces from inside the syscall hook code. */
+        .cfi_startproc
+        /* Save fake return address and old sp to the stack, for gdb to use
+           during stack unwinding. Addresses will be filled in by rr. */
+        movl   $0x12345678,-_syscall_stack_adjust(%rsp)
+        /* Backtrace here will be invalid! */
+        movl   $0x12345678,(-_syscall_stack_adjust+4)(%rsp)
+        /* Backtrace here will be invalid! */
+        mov    %rsp,(-_syscall_stack_adjust+8)(%rsp)
+        /* Backtrace here will be invalid! */
+        lea    -_syscall_stack_adjust(%rsp),%rsp
+        .cfi_rel_offset %rsp,8
+        /* We won't be able to get complete stack traces inside the above
+           sequence, but that's not important. What's important is that at this
+           point:
+           * (%rsp) contains a "return address" for this stub that points
+             back to the patch site.
+           * (%rsp+8) contains the value of %rsp that will hold at the
+             patch site, and we've emitted CFI data to indicate that.
+           This makes gdb treat the patch site as the caller of this stub,
+           even though no call actually happened. */
+        call  _stub_buffer /* FAKE, filled in by rr */
+        /* A backtrace here will be valid since for unwinding purposes we're
+           basically in the same state as before the call. */
+        lea    _syscall_stack_adjust(%rsp),%rsp
+        /* Backtrace here will be invalid! */
+        /* Jump to the return address we saved on the stack */
+        jmp    *(-_syscall_stack_adjust)(%rsp)
+        .cfi_endproc
+        .endr
+_stub_buffer_end:
 
 #endif /* __x86_64__ */
 

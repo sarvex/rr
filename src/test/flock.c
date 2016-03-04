@@ -4,10 +4,10 @@
 
 #define FILENAME "foo.txt"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   ssize_t pagesize = sysconf(_SC_PAGESIZE);
   int fd;
-  int i;
+  size_t i;
   int err;
   pid_t parent_pid = getpid();
   pid_t pid;
@@ -27,10 +27,10 @@ int main(int argc, char* argv[]) {
   }
 
   {
-    struct flock lock = { .l_type = F_RDLCK,
-                          .l_whence = SEEK_SET,
-                          .l_start = pagesize,
-                          .l_len = -pagesize / 2 };
+    struct flock lock = {.l_type = F_RDLCK,
+                         .l_whence = SEEK_SET,
+                         .l_start = pagesize,
+                         .l_len = -pagesize / 2 };
 
     atomic_printf("sizeof(flock) = %zu\n", sizeof(lock));
 

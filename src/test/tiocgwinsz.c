@@ -2,13 +2,13 @@
 
 #include "rrutil.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   int ret;
   struct winsize w;
 
   memset(&w, 0x5a, sizeof(w));
   ret = ioctl(STDIN_FILENO, TIOCGWINSZ, &w);
-  atomic_printf("TIOCWINSZ returned {row:%d col:%d} (ret:%d)\n", w.ws_row,
+  atomic_printf("TIOCGWINSZ returned {row:%d col:%d} (ret:%d)\n", w.ws_row,
                 w.ws_col, ret);
 
   atomic_puts("EXIT-SUCCESS");

@@ -25,7 +25,7 @@ string syscall_name(int syscall, SupportedArch arch) {
   case _id:                                                                    \
     return #_id;
 
-const char* ptrace_event_name(int event) {
+string ptrace_event_name(int event) {
   switch (event) {
     CASE(PTRACE_EVENT_FORK);
     CASE(PTRACE_EVENT_VFORK);
@@ -39,13 +39,16 @@ const char* ptrace_event_name(int event) {
     CASE(PTRACE_EVENT_SECCOMP_OBSOLETE);
     CASE(PTRACE_EVENT_SECCOMP);
     CASE(PTRACE_EVENT_STOP);
-    default:
-      return "???PTRACE_EVENT";
+    default: {
+      char buf[100];
+      sprintf(buf, "PTRACE_EVENT(%d)", event);
+      return string(buf);
+    }
   }
 }
 
-const char* ptrace_req_name(int request) {
-  switch (int(request)) {
+string ptrace_req_name(int request) {
+  switch (request) {
     CASE(PTRACE_TRACEME);
     CASE(PTRACE_PEEKTEXT);
     CASE(PTRACE_PEEKDATA);
@@ -77,16 +80,19 @@ const char* ptrace_req_name(int request) {
     // These aren't part of the official ptrace-request enum.
     CASE(PTRACE_SYSEMU);
     CASE(PTRACE_SYSEMU_SINGLESTEP);
-    default:
-      return "???PTRACE_REQ";
+    default: {
+      char buf[100];
+      sprintf(buf, "PTRACE_REQUEST(%d)", request);
+      return string(buf);
+    }
   }
 }
 
-const char* signal_name(int sig) {
+string signal_name(int sig) {
   /* strsignal() would be nice to use here, but it provides TMI. */
-  if (SIGRTMIN <= sig && sig <= SIGRTMAX) {
-    static __thread char buf[] = "SIGRT00000000";
-    snprintf(buf, sizeof(buf) - 1, "SIGRT%d", sig - SIGRTMIN);
+  if (32 <= sig && sig <= 64) {
+    char buf[100];
+    snprintf(buf, sizeof(buf) - 1, "SIGRT%d", sig);
     return buf;
   }
 
@@ -122,15 +128,12 @@ const char* signal_name(int sig) {
     CASE(SIGIO);
     CASE(SIGPWR);
     CASE(SIGSYS);
-    default:
-      return "???signal";
+    default: {
+      char buf[100];
+      sprintf(buf, "signal(%d)", sig);
+      return string(buf);
+    }
   }
-}
-
-#include "IsAlwaysEmulatedSyscall.generated"
-
-bool is_always_emulated_syscall(int syscall, SupportedArch arch) {
-  RR_ARCH_FUNCTION(is_always_emulated_syscall_arch, arch, syscall);
 }
 
 bool is_sigreturn(int syscallno, SupportedArch arch) {
@@ -138,7 +141,7 @@ bool is_sigreturn(int syscallno, SupportedArch arch) {
          is_rt_sigreturn_syscall(syscallno, arch);
 }
 
-const char* errno_name(int err) {
+string errno_name(int err) {
   switch (err) {
     case 0:
       return "SUCCESS";
@@ -273,12 +276,15 @@ const char* errno_name(int err) {
       CASE(ENOTRECOVERABLE);
       CASE(ERFKILL);
       CASE(EHWPOISON);
-    default:
-      return "???errno";
+    default: {
+      char buf[100];
+      sprintf(buf, "errno(%d)", err);
+      return string(buf);
+    }
   }
 }
 
-const char* sicode_name(int code, int sig) {
+string sicode_name(int code, int sig) {
   switch (code) {
     CASE(SI_USER);
     CASE(SI_KERNEL);
@@ -288,6 +294,7 @@ const char* sicode_name(int code, int sig) {
     CASE(SI_ASYNCIO);
     CASE(SI_SIGIO);
     CASE(SI_TKILL);
+    CASE(SI_ASYNCNL);
   }
 
   switch (sig) {
@@ -296,14 +303,71 @@ const char* sicode_name(int code, int sig) {
         CASE(SEGV_MAPERR);
         CASE(SEGV_ACCERR);
       }
+      break;
     case SIGTRAP:
       switch (code) {
         CASE(TRAP_BRKPT);
         CASE(TRAP_TRACE);
       }
+      break;
+    case SIGILL:
+      switch (code) {
+        CASE(ILL_ILLOPC);
+        CASE(ILL_ILLOPN);
+        CASE(ILL_ILLADR);
+        CASE(ILL_ILLTRP);
+        CASE(ILL_PRVOPC);
+        CASE(ILL_PRVREG);
+        CASE(ILL_COPROC);
+        CASE(ILL_BADSTK);
+      }
+      break;
+    case SIGFPE:
+      switch (code) {
+        CASE(FPE_INTDIV);
+        CASE(FPE_INTOVF);
+        CASE(FPE_FLTDIV);
+        CASE(FPE_FLTOVF);
+        CASE(FPE_FLTUND);
+        CASE(FPE_FLTRES);
+        CASE(FPE_FLTINV);
+        CASE(FPE_FLTSUB);
+      }
+      break;
+    case SIGBUS:
+      switch (code) {
+        CASE(BUS_ADRALN);
+        CASE(BUS_ADRERR);
+        CASE(BUS_OBJERR);
+        CASE(BUS_MCEERR_AR);
+        CASE(BUS_MCEERR_AO);
+      }
+      break;
+    case SIGCHLD:
+      switch (code) {
+        CASE(CLD_EXITED);
+        CASE(CLD_KILLED);
+        CASE(CLD_DUMPED);
+        CASE(CLD_TRAPPED);
+        CASE(CLD_STOPPED);
+        CASE(CLD_CONTINUED);
+      }
+      break;
+    case SIGPOLL:
+      switch (code) {
+        CASE(POLL_IN);
+        CASE(POLL_OUT);
+        CASE(POLL_MSG);
+        CASE(POLL_ERR);
+        CASE(POLL_PRI);
+        CASE(POLL_HUP);
+      }
+      break;
   }
 
-  return "???sicode";
+  char buf[100];
+  sprintf(buf, "sicode(%d)", code);
+  return string(buf);
 }
 
 std::ostream& operator<<(std::ostream& stream, const siginfo_t& siginfo) {

@@ -17,14 +17,16 @@
 #include "PerfCounters.h"
 #include "PropertyTable.h"
 #include "Registers.h"
+#include "remote_code_ptr.h"
 #include "TaskishUid.h"
 #include "TraceStream.h"
 #include "util.h"
 
 class AutoRemoteSyscalls;
-class Session;
 class RecordSession;
 class ReplaySession;
+class ScopedFd;
+class Session;
 struct Sighandlers;
 class Task;
 
@@ -39,9 +41,7 @@ struct syscallbuf_record;
  * all zeroes.
  */
 struct ReturnAddressList {
-  enum {
-    COUNT = 8
-  };
+  enum { COUNT = 8 };
   remote_ptr<void> addresses[COUNT];
 
   bool operator==(const ReturnAddressList& other) const {
@@ -79,7 +79,8 @@ public:
 
   int exit_code;
 
-  void forget_session() { session = nullptr; }
+  Session* session() const { return session_; }
+  void forget_session() { session_ = nullptr; }
 
   TaskGroup* parent() { return parent_; }
 
@@ -93,7 +94,7 @@ private:
   TaskGroup(const TaskGroup&) = delete;
   TaskGroup operator=(const TaskGroup&) = delete;
 
-  Session* session;
+  Session* session_;
   /** Parent TaskGroup, or nullptr if it's not a tracee (rr or init). */
   TaskGroup* parent_;
 
@@ -149,10 +150,16 @@ enum WaitRequest {
   // Don't wait after resuming.
   RESUME_NONBLOCKING
 };
-
-enum ShareDeschedEventFd {
-  SHARE_DESCHED_EVENT_FD = 1,
-  DONT_SHARE_DESCHED_EVENT_FD = 0
+enum TicksRequest {
+  // We don't expect to see any ticks (though we seem to on the odd buggy
+  // system...). Using this is a small performance optimization because we don't
+  // have to stop and restart the performance counters. This may also avoid
+  // bugs on some systems that report performance counter advances while
+  // in the kernel...
+  RESUME_NO_TICKS = -2,
+  RESUME_UNLIMITED_TICKS = -1
+  // Positive values are a request for an interrupt
+  // after that number of ticks
 };
 
 /** Different kinds of waits a task can do.
@@ -176,6 +183,20 @@ enum EmulatedStopType {
   NOT_STOPPED,
   GROUP_STOP,          // stopped by a signal. This applies to non-ptracees too.
   SIGNAL_DELIVERY_STOP // Stopped before delivering a signal. ptracees only.
+};
+
+/** Reasons why a SIGTRAP might have been delivered. Multiple reasons can
+ * apply. Also, none can apply, e.g. if someone sent us a SIGTRAP via kill().
+ */
+struct TrapReasons {
+  /* Singlestep completed (RESUME_SINGLESTEP, RESUME_SYSEMU_SINGLESTEP). */
+  bool singlestep;
+  /* Hardware watchpoint fired. This includes cases where the actual values
+   * did not change (i.e. AddressSpace::has_any_watchpoint_changes may return
+   * false even though this is set). */
+  bool watchpoint;
+  /* Breakpoint instruction was executed. */
+  bool breakpoint;
 };
 
 /**
@@ -210,64 +231,28 @@ public:
   bool at_may_restart_syscall() const;
 
   /**
-   * Continue according to the semantics implied by the helper's
-   * name.  See the ptrace manual for details of semantics.  If
-   * |sig| is nonzero, it's delivered to this as part of the
-   * resume request.
-   *
-   * By default, wait for status to change after resuming,
-   * before returning.  Return true if successful, false if
-   * interrupted.  Don't wait for status change in the
-   * "_nonblocking()" variants.
-   */
-  void cont_nonblocking(int sig = 0, Ticks tick_period = 0) {
-    resume_execution(RESUME_CONT, RESUME_NONBLOCKING, sig, tick_period);
-  }
-  void cont_singlestep(int sig = 0) {
-    resume_execution(RESUME_SINGLESTEP, RESUME_WAIT, sig);
-  }
-  void cont_syscall(int sig = 0) {
-    resume_execution(RESUME_SYSCALL, RESUME_WAIT);
-  }
-  void cont_syscall_nonblocking(int sig = 0, Ticks tick_period = 0) {
-    resume_execution(RESUME_SYSCALL, RESUME_NONBLOCKING, sig, tick_period);
-  }
-  void cont_sysemu(int sig = 0) {
-    resume_execution(RESUME_SYSEMU, RESUME_WAIT, sig);
-  }
-  void cont_sysemu_singlestep(int sig = 0) {
-    resume_execution(RESUME_SYSEMU_SINGLESTEP, RESUME_WAIT, sig);
-  }
-
-  /**
    * This must be in an emulated syscall, entered through
    * |cont_sysemu()| or |cont_sysemu_singlestep()|, but that's
    * not checked.  If so, step over the system call instruction
    * to "exit" the emulated syscall.
-   *
-   * This operation is (assumed to be) idempotent:
-   * |finish_emulated_syscall()| can be called any number of
-   * times without changing state other than
-   * emulated-syscall-exited-ness.  Checkpointing relies on this
-   * assumption.
    */
   void finish_emulated_syscall();
 
   /**
-   * Shortcut to the single |pending_event->desched.rec| when
-   * there's one desched event on the stack, and nullptr otherwise.
+   * Shortcut to the most recent |pending_event->desched.rec| when
+   * there's a desched event on the stack, and nullptr otherwise.
    * Exists just so that clients don't need to dig around in the
    * event stack to find this record.
    */
   const struct syscallbuf_record* desched_rec() const;
 
+  /**
+   * Returns true when the task is in a signal handler in an interrupted
+   * system call being handled by syscall buffering.
+   */
+  bool running_inside_desched() const;
+
   size_t syscallbuf_data_size() const {
-    if (syscallbuf_hdr->locked) {
-      // There may be an incomplete syscall record after num_rec_bytes that
-      // we need to record. We don't know how big that record is,
-      // so just record the entire buffer. This should not be common.
-      return num_syscallbuf_bytes;
-    }
     return syscallbuf_hdr->num_rec_bytes + sizeof(*syscallbuf_hdr);
   }
 
@@ -418,15 +403,19 @@ public:
   Event& ev() { return pending_events.back(); }
   const Event& ev() const { return pending_events.back(); }
 
-  struct FStatResult {
-    struct stat st;
-    std::string file_name;
-  };
   /**
-   * Stat |fd| in the context of this task's fd table, returning
-   * the result and the file name in FStatResult.
+   * Stat |fd| in the context of this task's fd table.
    */
-  FStatResult fstat(int fd);
+  struct stat stat_fd(int fd);
+  /**
+   * Open |fd| in the context of this task's fd table.
+   */
+  ScopedFd open_fd(int fd, int flags);
+  /**
+   * Get the name of the file referenced by |fd| in the context of this
+   * task's fd table.
+   */
+  std::string file_name_of_fd(int fd);
 
   /**
    * Force the wait status of this to |status|, as if
@@ -436,6 +425,13 @@ public:
    * use *override_siginfo as the siginfo instead of reading it from the kernel.
    */
   void did_waitpid(int status, siginfo_t* override_siginfo = nullptr);
+
+  /**
+   * Syscalls have side effects on registers (e.g. setting the flags register).
+   * Perform those side effects on |regs| and do set_regs() on that to make it
+   * look like a syscall happened.
+   */
+  void emulate_syscall_entry(const Registers& regs);
 
   /**
    * Wait for |futex| in this address space to have the value
@@ -452,6 +448,8 @@ public:
    * event, f.e. the new child's pid at PTRACE_EVENT_CLONE.
    */
   pid_t get_ptrace_eventmsg_pid();
+
+  uint16_t get_ptrace_eventmsg_seccomp_data();
 
   /**
    * Return the siginfo at the signal-stop of this.
@@ -481,8 +479,7 @@ public:
    *
    * Pass SHARE_DESCHED_EVENT_FD to additionally share that fd.
    */
-  void init_buffers(remote_ptr<void> map_hint,
-                    ShareDeschedEventFd share_desched_fd);
+  void init_buffers(remote_ptr<void> map_hint);
 
   /**
    * Destroy in the tracee task the scratch buffer and syscallbuf (if
@@ -493,7 +490,7 @@ public:
   void destroy_buffers();
 
   /** Return the current $ip of this. */
-  remote_ptr<uint8_t> ip() { return regs().ip(); }
+  remote_code_ptr ip() { return regs().ip(); }
 
   /**
    * Return true if this is at an arm-desched-event syscall.
@@ -517,7 +514,10 @@ public:
    * code. Callers may assume |is_in_syscallbuf()| is implied
    * by this.
    */
-  bool is_entering_traced_syscall() { return ip() == as->traced_syscall_ip(); }
+  bool is_entering_traced_syscall() {
+    return ip() == as->traced_syscall_ip() ||
+           ip() == as->privileged_traced_syscall_ip();
+  }
 
   /**
    * Return true if this is within the syscallbuf library.  This
@@ -525,8 +525,9 @@ public:
    * below.
    */
   bool is_in_syscallbuf() {
-    remote_ptr<void> p = ip();
-    return (as->syscallbuf_lib_start() <= p && p < as->syscallbuf_lib_end()) ||
+    remote_ptr<void> p = ip().to_data_ptr<void>();
+    return (as->syscallbuf_lib_start() <= p && p < as->syscallbuf_lib_end() &&
+            !as->monkeypatcher().is_syscallbuf_excluded_instruction(p)) ||
            (as->rr_page_start() <= p && p < as->rr_page_end());
   }
 
@@ -538,7 +539,11 @@ public:
    */
   bool is_in_traced_syscall() {
     return ip() ==
-           as->traced_syscall_ip() + rr::syscall_instruction_length(arch());
+               as->traced_syscall_ip().increment_by_syscall_insn_length(
+                   arch()) ||
+           ip() ==
+               as->privileged_traced_syscall_ip()
+                   .increment_by_syscall_insn_length(arch());
   }
 
   /**
@@ -549,20 +554,10 @@ public:
    * instruction.
    */
   bool is_in_untraced_syscall() {
-    return ip() ==
-           as->untraced_syscall_ip() + rr::syscall_instruction_length(arch());
+    return ip() == AddressSpace::rr_page_ip_in_untraced_syscall() ||
+           ip() == AddressSpace::rr_page_ip_in_untraced_replayed_syscall() ||
+           ip() == AddressSpace::rr_page_ip_in_privileged_untraced_syscall();
   }
-
-  /**
-   * Return true if this task is most likely entering or exiting
-   * a syscall.
-   *
-   * No false negatives are known to be possible (i.e. if this
-   * task really is replaying a syscall, true will be returned),
-   * however false positives are possible.  Callers should
-   * therefore use this return value conservatively.
-   */
-  bool is_probably_replaying_syscall();
 
   /**
    * Return true if |ptrace_event()| is the trace event
@@ -573,6 +568,9 @@ public:
 
   /** Return true iff |sig| is blocked for this. */
   bool is_sig_blocked(int sig) const;
+
+  /** Set |sig| to be treated as blocked. */
+  void set_sig_blocked(int sig);
 
   /**
    * Return true iff |sig| is SIG_IGN, or it's SIG_DFL and the
@@ -615,6 +613,19 @@ public:
   void move_ip_before_breakpoint();
 
   /**
+   * Assuming we've just entered a syscall, exit that syscall and reset
+   * state to reenter the syscall just as it was called the first time.
+   */
+  void exit_syscall_and_prepare_restart();
+
+  /**
+   * Resume execution until we get a syscall entry or exit event.
+   * During recording, any signals received are stashed.
+   * seccomp events are ignored; we assume this syscall is under rr's control.
+   */
+  void advance_syscall();
+
+  /**
    * Return the "task name"; i.e. what |prctl(PR_GET_NAME)| or
    * /proc/tid/comm would say that the task's name is.
    */
@@ -628,7 +639,8 @@ public:
    * recorded immediately after the exec.
    */
   void post_exec(const Registers* replay_regs = nullptr,
-                 const ExtraRegisters* replay_extra_regs = nullptr);
+                 const ExtraRegisters* replay_extra_regs = nullptr,
+                 const std::string* replay_exe = nullptr);
 
   /**
    * Call this method when this task has exited a successful execve() syscall.
@@ -658,7 +670,7 @@ public:
    * return.
    */
   template <size_t N>
-  void read_bytes(remote_ptr<void> child_addr, uint8_t (&buf)[N]) {
+  void read_bytes(remote_ptr<void> child_addr, uint8_t(&buf)[N]) {
     return read_bytes_helper(child_addr, N, buf);
   }
 
@@ -671,7 +683,14 @@ public:
    * |record_event()| records the specified event.
    */
   void record_current_event();
-  void record_event(const Event& ev);
+  enum FlushSyscallbuf {
+    FLUSH_SYSCALLBUF,
+    /* Pass this if it's safe to replay the event before we process the
+     * syscallbuf records.
+     */
+    DONT_FLUSH_SYSCALLBUF
+  };
+  void record_event(const Event& ev, FlushSyscallbuf flush = FLUSH_SYSCALLBUF);
 
   /**
    * Save tracee data to the trace.  |addr| is the address in
@@ -691,6 +710,9 @@ public:
     record_remote(addr, sizeof(T));
   }
 
+  // Record as much as we can of the bytes in this range.
+  void record_remote_fallible(remote_ptr<void> addr, ssize_t num_bytes);
+
   /**
    * Save tracee data to the trace.  |addr| is the address in
    * the address space of this task.
@@ -700,8 +722,6 @@ public:
   template <typename T> void record_remote_even_if_null(remote_ptr<T> addr) {
     record_remote_even_if_null(addr, sizeof(T));
   }
-
-  void record_remote_str(remote_ptr<void> str);
 
   /** Return the current regs of this. */
   const Registers& regs() const;
@@ -740,16 +760,21 @@ public:
   ReturnAddressList return_addresses();
 
   /**
-   * Return the debug status, which is a bitfield comprising
-   * |DebugStatus| bits (see above).
+   * Return the debug status (DR6 on x86). The debug status is always cleared
+   * in resume_execution() before we resume, so it always only reflects the
+   * events since the last resume.
    */
   uintptr_t debug_status();
   /**
-   * Return the debug status, which is a bitfield comprising
-   * |DebugStatus| bits (see above), and clear the kernel state.
+   * Set the debug status (DR6 on x86).
    */
-  uintptr_t consume_debug_status();
-  void replace_debug_status(uintptr_t status);
+  void set_debug_status(uintptr_t status);
+
+  /**
+   * Determine why a SIGTRAP occurred. Uses debug_status() but doesn't
+   * consume it.
+   */
+  TrapReasons compute_trap_reasons();
 
   /**
    * Return the address of the watchpoint programmed at slot
@@ -762,10 +787,13 @@ public:
 
   /**
    * Read |val| from |child_addr|.
+   * If the data can't all be read, then if |ok| is non-null
+   * sets *ok to false, otherwise asserts.
    */
-  template <typename T> T read_mem(remote_ptr<T> child_addr) {
+  template <typename T>
+  T read_mem(remote_ptr<T> child_addr, bool* ok = nullptr) {
     T val;
-    read_bytes_helper(child_addr, sizeof(val), &val);
+    read_bytes_helper(child_addr, sizeof(val), &val, ok);
     return val;
   }
 
@@ -773,10 +801,11 @@ public:
    * Read |count| values from |child_addr|.
    */
   template <typename T>
-  std::vector<T> read_mem(remote_ptr<T> child_addr, size_t count) {
+  std::vector<T> read_mem(remote_ptr<T> child_addr, size_t count,
+                          bool* ok = nullptr) {
     std::vector<T> v;
     v.resize(count);
-    read_bytes_helper(child_addr, sizeof(T) * count, v.data());
+    read_bytes_helper(child_addr, sizeof(T) * count, v.data(), ok);
     return v;
   }
 
@@ -784,7 +813,7 @@ public:
    * Read and return the C string located at |child_addr| in
    * this address space.
    */
-  std::string read_c_str(remote_ptr<void> child_addr);
+  std::string read_c_str(remote_ptr<char> child_addr);
 
   /**
    * Copy |num_bytes| from |src| to |dst| in the address space
@@ -803,12 +832,14 @@ public:
    * After resuming, |wait_how|. In replay, reset hpcs and
    * request a tick period of tick_period. The default value
    * of tick_period is 0, which means effectively infinite.
+   * If interrupt_after_elapsed is nonzero, we interrupt the task
+   * after that many seconds have elapsed.
    *
    * You probably want to use one of the cont*() helpers above,
    * and not this.
    */
-  void resume_execution(ResumeRequest how, WaitRequest wait_how, int sig = 0,
-                        Ticks tick_period = 0);
+  void resume_execution(ResumeRequest how, WaitRequest wait_how,
+                        TicksRequest tick_period, int sig = 0);
 
   /** Return the session this is part of. */
   Session& session() const { return *session_; }
@@ -863,11 +894,13 @@ public:
   size_t robust_list_len() const { return robust_futex_list_len; }
 
   /** Update the thread area to |addr|. */
-  void set_thread_area(remote_ptr<void> tls);
-  const struct user_desc* tls() const;
+  void set_thread_area(remote_ptr<struct user_desc> tls);
+
+  const std::vector<struct user_desc>& thread_areas() { return thread_areas_; }
 
   /** Update the clear-tid futex to |tid_addr|. */
   void set_tid_addr(remote_ptr<int> tid_addr);
+  remote_ptr<int> tid_addr() { return tid_futex; }
 
   /**
    * Call this after |sig| is delivered to this task.  Emulate
@@ -888,7 +921,12 @@ public:
    * If signal_has_user_handler(sig) is true, return the address of the
    * user handler, otherwise return null.
    */
-  remote_ptr<uint8_t> get_signal_user_handler(int sig) const;
+  remote_code_ptr get_signal_user_handler(int sig) const;
+  /**
+   * Return true if the signal handler for |sig| takes a siginfo_t*
+   * parameter.
+   */
+  bool signal_handler_takes_siginfo(int sig) const;
 
   /**
    * Return |sig|'s current sigaction. Returned as raw bytes since the
@@ -917,9 +955,23 @@ public:
    * stash anything.
    */
   void stash_sig();
+  void stash_synthetic_sig(const siginfo_t& si);
   bool has_stashed_sig() const { return !stashed_signals.empty(); }
   siginfo_t peek_stash_sig();
-  siginfo_t pop_stash_sig();
+  void pop_stash_sig();
+
+  /**
+   * When a signal triggers an emulated a ptrace-stop for this task,
+   * save the siginfo so a later emulated ptrace-continue with this signal
+   * number can use it.
+   */
+  void save_ptrace_signal_siginfo(const siginfo_t& si);
+  /**
+   * When emulating a ptrace-continue with a signal number, extract the siginfo
+   * that was saved by |save_ptrace_signal_siginfo|. If no such siginfo was
+   * saved, make one up.
+   */
+  siginfo_t take_ptrace_signal_siginfo(int sig);
 
   /**
    * Return true when the task is running, false if it's stopped.
@@ -952,10 +1004,7 @@ public:
    */
   int pending_sig() const { return pending_sig_from_status(wait_status); }
 
-  /**
-   * Return true if we stopped due to a syscall event.
-   */
-  bool syscall_stop() const { return stop_sig() == (SIGTRAP | 0x80); }
+  void clear_wait_status() { wait_status = 0; }
 
   /** Return the task group this belongs to. */
   TaskGroup::shr_ptr task_group() { return tg; }
@@ -1000,8 +1049,31 @@ public:
    * Call this before recording events or data.  Records
    * syscallbuf data and flushes the buffer, if there's buffered
    * data.
+   *
+   * The timing of calls to this is tricky. We must flush the syscallbuf
+   * before recording any data associated with events that happened after the
+   * buffered syscalls. But we don't support flushing a syscallbuf twice with
+   * no intervening reset, i.e. after flushing we have to be sure we'll get
+   * a chance to reset the syscallbuf (i.e. record some other kind of event)
+   * before the tracee runs again in a way that might append another buffered
+   * syscall --- so we can't flush too early
    */
   void maybe_flush_syscallbuf();
+
+  /**
+   * Call this after recording an event when it might be safe to reset the
+   * syscallbuf. It must be after recording an event to ensure during replay
+   * we run past any syscallbuf after-syscall code that uses the buffer data.
+   */
+  void maybe_reset_syscallbuf();
+
+  /**
+   * Call this to reset syscallbuf_hdr->num_rec_bytes and zero out the data
+   * recorded in the syscall buffer. This makes for more deterministic behavior
+   * especially during replay, where during checkpointing we only save and
+   * restore the recorded data area.
+   */
+  void reset_syscallbuf();
 
   /**
    * Return the virtual memory mapping (address space) of this
@@ -1011,22 +1083,23 @@ public:
 
   FdTable::shr_ptr fd_table() { return fds; }
 
-  enum AllowInterrupt {
-    ALLOW_INTERRUPT,
-    // Pass this when the caller has already triggered a ptrace stop
-    // and wait() must not trigger a new one.
-    DONT_ALLOW_INTERRUPT
-  };
   /**
    * Block until the status of this changes. wait() expects the wait to end
-   * with the process in a stopped() state.
+   * with the process in a stopped() state. If interrupt_after_elapsed > 0,
+   * interrupt the task after that many seconds have elapsed.
    */
-  void wait(AllowInterrupt allow_interrupt = ALLOW_INTERRUPT);
+  void wait(double interrupt_after_elapsed = 0);
   /**
    * Return true if the status of this has changed, but don't
    * block.
    */
   bool try_wait();
+
+  /**
+   * Returns true if it looks like this task has been spinning on an atomic
+   * access/lock.
+   */
+  bool maybe_in_spinlock();
 
   /**
    * Currently we don't allow recording across uid changes, so we can just
@@ -1035,22 +1108,21 @@ public:
   uid_t getuid() { return ::getuid(); }
 
   /**
-   * Write |N| bytes from |buf| to |child_addr|, or don't
-   * return.
+   * Write |N| bytes from |buf| to |child_addr|, or don't return.
    */
   template <size_t N>
-  void write_bytes(remote_ptr<void> child_addr, const uint8_t (&buf)[N]) {
+  void write_bytes(remote_ptr<void> child_addr, const uint8_t(&buf)[N]) {
     write_bytes_helper(child_addr, N, buf);
   }
 
   /**
    * Write |val| to |child_addr|.
-   *
-   * NB: doesn't use the ptrace API, so safe to use even when
-   * the tracee isn't at a trace-stop.
    */
-  template <typename T> void write_mem(remote_ptr<T> child_addr, const T& val) {
-    write_bytes_helper(child_addr, sizeof(val), static_cast<const void*>(&val));
+  template <typename T>
+  void write_mem(remote_ptr<T> child_addr, const T& val, bool* ok = nullptr) {
+    assert(type_has_no_holes<T>());
+    write_bytes_helper(child_addr, sizeof(val), static_cast<const void*>(&val),
+                       ok);
   }
   /**
    * This is not the helper you're looking for.  See above: you
@@ -1062,6 +1134,7 @@ public:
 
   template <typename T>
   void write_mem(remote_ptr<T> child_addr, const T* val, int count) {
+    assert(type_has_no_holes<T>());
     write_bytes_helper(child_addr, sizeof(*val) * count,
                        static_cast<const void*>(val));
   }
@@ -1075,9 +1148,14 @@ public:
    */
   ssize_t read_bytes_fallible(remote_ptr<void> addr, ssize_t buf_size,
                               void* buf);
-  void read_bytes_helper(remote_ptr<void> addr, ssize_t buf_size, void* buf);
+  /**
+   * If the data can't all be read, then if |ok| is non-null, sets *ok to
+   * false, otherwise asserts.
+   */
+  void read_bytes_helper(remote_ptr<void> addr, ssize_t buf_size, void* buf,
+                         bool* ok = nullptr);
   void write_bytes_helper(remote_ptr<void> addr, ssize_t buf_size,
-                          const void* buf);
+                          const void* buf, bool* ok = nullptr);
 
   /** See |pending_sig()| above. */
   int pending_sig_from_status(int status) const;
@@ -1092,9 +1170,22 @@ public:
   /**
    * Call this when performing a clone syscall in this task. Returns
    * true if the call completed, false if it was interrupted and
-   * needs to be resumed.
+   * needs to be resumed. When the call returns true, the task is
+   * stopped at a PTRACE_EVENT_CLONE or PTRACE_EVENT_FORK.
    */
   bool clone_syscall_is_complete();
+
+  /**
+   * Return the pid of the newborn thread created by this task.
+   * Called when this task has a PTRACE_CLONE_EVENT with CLONE_THREAD.
+   */
+  pid_t find_newborn_thread();
+  /**
+   * Return the pid of the newborn process created by this task.
+   * Called when this task has a PTRACE_CLONE_EVENT without CLONE_THREAD,
+   * or PTRACE_FORK_EVENT.
+   */
+  pid_t find_newborn_child_process();
 
   /**
    * Called when SYS_rrcall_init_preload has happened.
@@ -1126,19 +1217,11 @@ public:
 
   /* State only used during recording. */
 
-  /* True when this is switchable for semantic purposes, but
-   * definitely isn't blocked on ony resource.  In that case,
-   * it's safe for the scheduler to do a blocking waitpid on
-   * this if our scheduling slot is open. */
-  bool pseudo_blocked;
-  /* Number of times this context has been scheduled in a row,
-   * which approximately corresponds to the number of events
-   * it's processed in succession.  The scheduler maintains this
-   * state and uses it to make scheduling decisions. */
-  uint32_t succ_event_counter;
+  std::unique_ptr<Registers> registers_at_start_of_uninterrupted_timeslice;
   /* True when any assumptions made about the status of this
    * process have been invalidated, and must be re-established
-   * with a waitpid() call. */
+   * with a waitpid() call. Only applies to tasks which are dying, usually
+   * due to a signal sent to the entire task group. */
   bool unstable;
   /* exit(), or exit_group() with one task, has been called, so
    * the exit can be treated as stable. */
@@ -1158,6 +1241,9 @@ public:
   // If not NOT_STOPPED, then the task is logically stopped and this is the type
   // of stop.
   EmulatedStopType emulated_stop_type;
+  // If not 0, then a CLOCK_MONOTONIC time (in seconds) at which this
+  // task is expected to wake from a system call (if not interrupted earlier).
+  double sleeping_until;
 
   // Task for which we're emulating ptrace of this task, or null
   Task* emulated_ptracer;
@@ -1220,17 +1306,12 @@ public:
    * next available slow (taking |desched| into
    * consideration). */
   bool flushed_syscallbuf;
+  /* Value of hdr->num_rec_bytes when the buffer was flushed */
+  uint32_t flushed_num_rec_bytes;
   /* This bit is set when code wants to prevent the syscall
    * record buffer from being reset when it normally would be.
    * Currently, the desched'd syscall code uses this. */
   bool delay_syscallbuf_reset;
-  /* This bit is set when code wants the syscallbuf to be
-   * "synthetically empty": even if the record counter is
-   * nonzero, it should not be flushed.  Currently, the
-   * desched'd syscall code uses this along with
-   * |delay_syscallbuf_reset| above to keep the syscallbuf
-   * intact during possibly many "reentrant" events. */
-  bool delay_syscallbuf_flush;
 
   /* The child's desched counter event fd number, and our local
    * dup. */
@@ -1246,14 +1327,8 @@ public:
    * any untraced ones; that's the magic "rrcall" the tracee
    * uses to initialize its syscallbuf. */
   bool seccomp_bpf_enabled;
-
-  /* State used only during replay. */
-
-  int child_sig;
-  // True when this has been forced to enter a syscall with
-  // PTRACE_SYSCALL when instead we wanted to use
-  // PTRACE_SINGLESTEP.  See replayer.cc.
-  bool stepped_into_syscall;
+  // Value to return from PR_GET_SECCOMP
+  uint8_t prctl_seccomp_status;
 
   /* State used during both recording and replay. */
 
@@ -1265,6 +1340,10 @@ public:
    * recording, it's synonymous with |tid|, and during replay
    * it's the tid that was recorded. */
   pid_t rec_tid;
+  /* This is the recorded tid of the tracee *in its own pid namespace*.
+   * Only valid during recording, otherwise 0!
+   */
+  pid_t own_namespace_rec_tid;
 
   /* Points at rr's mapping of the (shared) syscall buffer. */
   struct syscallbuf_hdr* syscallbuf_hdr;
@@ -1272,6 +1351,8 @@ public:
   /* Points at the tracee's mapping of the buffer. */
   remote_ptr<struct syscallbuf_hdr> syscallbuf_child;
   remote_ptr<char> syscallbuf_fds_disabled_child;
+  remote_code_ptr stopping_breakpoint_table;
+  int stopping_breakpoint_table_entry_size;
 
   PropertyTable& properties() { return properties_; }
 
@@ -1283,8 +1364,7 @@ public:
     std::string prname;
     remote_ptr<void> robust_futex_list;
     size_t robust_futex_list_len;
-    struct user_desc thread_area;
-    bool thread_area_valid;
+    std::vector<struct user_desc> thread_areas;
     size_t num_syscallbuf_bytes;
     int desched_fd_child;
     remote_ptr<struct syscallbuf_hdr> syscallbuf_child;
@@ -1311,9 +1391,7 @@ private:
   template <typename Arch> void update_sigaction_arch(const Registers& regs);
 
   /** Helper function for init_buffers. */
-  template <typename Arch>
-  void init_buffers_arch(remote_ptr<void> map_hint,
-                         ShareDeschedEventFd share_desched_fd);
+  template <typename Arch> void init_buffers_arch(remote_ptr<void> map_hint);
 
   /**
    * Return a new Task cloned from |p|.  |flags| are a set of
@@ -1351,15 +1429,6 @@ private:
    * tracee-side state).
    */
   void destroy_local_buffers();
-
-  /**
-   * Detach this from rr and try hard to ensure any operations
-   * related to it have completed by the time this function
-   * returns.
-   *
-   * Warning: called by destructor.
-   */
-  void detach_and_reap();
 
   /**
    * Make the ptrace |request| with |addr| and |data|, return
@@ -1415,23 +1484,6 @@ private:
    * True if this has blocked delivery of the desched signal.
    */
   bool is_desched_sig_blocked();
-
-  /**
-   * Prepare to forcibly kill this task by detaching it first. To ensure
-   * the task doesn't continue executing, we first set its ip() to an invalid
-   * value. We need to do this for all tasks in the Session before kill()
-   * is guaranteed to work properly. SIGKILL on ptrace-attached tasks seems
-   * to not work very well, and after sending SIGKILL we can't seem to
-   * reliably detach.
-   */
-  void prepare_kill();
-  /**
-   * Destroy the OS task backing this by sending it SIGKILL and
-   * ensuring it was delivered.  After |kill()|, the only
-   * meaningful thing that can be done with this task is to
-   * delete it.
-   */
-  void kill();
 
   /**
    * Make the OS-level calls to create a new fork or clone that
@@ -1497,6 +1549,9 @@ private:
   Ticks ticks;
   // When |is_stopped|, these are our child registers.
   Registers registers;
+  // True when there was a breakpoint set at the location where we resumed
+  // execution
+  remote_code_ptr address_of_last_execution_resume;
   // True when we know via waitpid() that the task is stopped and we haven't
   // resumed it.
   bool is_stopped;
@@ -1523,17 +1578,15 @@ private:
   std::shared_ptr<Sighandlers> sighandlers;
   // Stashed signal-delivery state, ready to be delivered at
   // next opportunity.
-  struct StashedSignal {
-    StashedSignal(const siginfo_t& si) : si(si) {}
-    siginfo_t si;
-  };
-  std::deque<StashedSignal> stashed_signals;
+  std::deque<siginfo_t> stashed_signals;
+  // Saved emulated-ptrace signals
+  std::vector<siginfo_t> saved_ptrace_siginfos;
   // The task group this belongs to.
   std::shared_ptr<TaskGroup> tg;
-  // Contents of the |tls| argument passed to |clone()| and
-  // |set_thread_area()|, when |thread_area_valid| is true.
-  struct user_desc thread_area;
-  bool thread_area_valid;
+  // Entries set by |set_thread_area()| or the |tls| argument to |clone()|
+  // (when that's a user_desc). May be more than one due to different
+  // entry_numbers.
+  std::vector<struct user_desc> thread_areas_;
   // The memory cell the kernel will clear and notify on exit,
   // if our clone parent requested it.
   remote_ptr<int> tid_futex;

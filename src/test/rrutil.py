@@ -1,6 +1,6 @@
 import pexpect, re, signal, sys, time
 
-__all__ = [ 'expect_gdb', 'send_gdb','expect_rr', 'send_rr', 'expect_list',
+__all__ = [ 'expect_gdb', 'send_gdb','expect_rr', 'expect_list',
             'restart_replay', 'interrupt_gdb', 'ok',
             'failed', 'iterlines_both', 'last_match', 'get_exe_arch' ]
 
@@ -36,26 +36,24 @@ def last_match():
 
 def restart_replay(event=0):
     if event:
-        send_gdb('r %d\n'%(event))
+        send_gdb('r %d'%(event))
     else:
-        send_gdb('r\n')
+        send_gdb('r')
     # gdb may not prompt here. It's ok to send an unnecessary 'y'
     # since there is no such command.
-    send_gdb('y\n')
+    send_gdb('y')
+    send_gdb('c')
 
 def send_gdb(what):
-    send(gdb_rr, what)
-
-def send_rr(what):
-    send(gdb_rr, what)
+    send(gdb_rr, "%s\n"%what)
 
 def ok():
-    send_gdb('q\n')
-    send_gdb('y\n')
+    send_gdb('q')
+    send_gdb('y')
     clean_up()
 
 # Internal helpers
-TIMEOUT_SEC = 20
+TIMEOUT_SEC = 100
 # gdb and rr are part of the same process tree, so they share
 # stdin/stdout.
 gdb_rr = None
@@ -67,12 +65,12 @@ def clean_up():
         try:
             gdb_rr.close(force=1)
             gdb_rr = None
-        except ExceptionPexpect, e:
+        except Exception, e:
             if iterations < 5:
                 print "close() failed with '%s', retrying..."%e
-                ++iterations
+                iterations = iterations + 1
             else:
-                raise e
+                gdb_rr = None
 
 def expect(prog, what):
     try:
@@ -81,7 +79,7 @@ def expect(prog, what):
         failed('expecting "%s"'% (what), e)
 
 def get_exe_arch():
-    send_gdb('show architecture\n')
+    send_gdb('show architecture')
     expect_gdb('The target architecture is set automatically \\(currently ([0-9a-z:-]+)\\)')
     global gdb_rr
     return gdb_rr.match.group(1)
@@ -102,7 +100,7 @@ def set_up():
     global gdb_rr
     try:
         gdb_rr = pexpect.spawn(*get_rr_cmd(), timeout=TIMEOUT_SEC, logfile=open('gdb_rr.log', 'w'))
-        expect_gdb(r'\(gdb\)')
+        expect_gdb(r'\(rr\)')
     except Exception, e:
         failed('initializing rr and gdb', e)
 

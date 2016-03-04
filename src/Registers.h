@@ -15,6 +15,7 @@
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
 #include "remote_ptr.h"
+#include "remote_code_ptr.h"
 
 class Task;
 
@@ -24,8 +25,12 @@ enum MismatchBehavior {
   BAIL_ON_MISMATCH
 };
 
-const uintptr_t X86_TF_FLAG = 0x100;
-const uintptr_t X86_DF_FLAG = 0x400;
+const uintptr_t X86_RESERVED_FLAG = 1 << 1;
+const uintptr_t X86_TF_FLAG = 1 << 8;
+const uintptr_t X86_IF_FLAG = 1 << 9;
+const uintptr_t X86_DF_FLAG = 1 << 10;
+const uintptr_t X86_RF_FLAG = 1 << 16;
+const uintptr_t X86_ID_FLAG = 1 << 21;
 
 /**
  * A Registers object contains values for all general-purpose registers.
@@ -47,9 +52,7 @@ const uintptr_t X86_DF_FLAG = 0x400;
  */
 class Registers {
 public:
-  enum {
-    MAX_SIZE = 16
-  };
+  enum { MAX_SIZE = 16 };
 
   Registers(SupportedArch a = SupportedArch(-1)) : arch_(a) {
     memset(&u, 0, sizeof(u));
@@ -109,8 +112,10 @@ public:
       assert(0 && "unknown architecture");                                     \
   }
 
-  remote_ptr<uint8_t> ip() const { return RR_GET_REG(eip, rip); }
-  void set_ip(remote_ptr<uint8_t> addr) { RR_SET_REG(eip, rip, addr.as_int()); }
+  remote_code_ptr ip() const { return RR_GET_REG(eip, rip); }
+  void set_ip(remote_code_ptr addr) {
+    RR_SET_REG(eip, rip, addr.register_value());
+  }
   remote_ptr<void> sp() const { return RR_GET_REG(esp, rsp); }
   void set_sp(remote_ptr<void> addr) { RR_SET_REG(esp, rsp, addr.as_int()); }
 
@@ -276,8 +281,6 @@ public:
     u.x64regs.r11 = value;
   }
 
-  bool df_flag() const { return RR_GET_REG(eflags, eflags) & X86_DF_FLAG; }
-
   uintptr_t di() const { return RR_GET_REG(edi, rdi); }
   void set_di(uintptr_t value) { RR_SET_REG(edi, rdi, value); }
 
@@ -289,7 +292,11 @@ public:
 
   uintptr_t bp() const { return RR_GET_REG(ebp, rbp); }
 
-  bool clear_singlestep_flag();
+  uintptr_t flags() const;
+  void set_flags(uintptr_t value);
+  bool singlestep_flag() { return flags() & X86_TF_FLAG; }
+  void clear_singlestep_flag() { set_flags(flags() & ~X86_TF_FLAG); }
+  bool df_flag() const { return flags() & X86_DF_FLAG; }
 
   // End of X86-specific stuff
 

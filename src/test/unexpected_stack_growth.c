@@ -8,7 +8,7 @@ static void breakpoint(void) {}
 
 static void funcall(void) {
   char buf[2000000];
-  int i;
+  size_t i;
   for (i = 0; i < sizeof(buf); ++i) {
     buf[i] = (char)i;
   }
@@ -17,7 +17,7 @@ static void funcall(void) {
   }
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   char v;
   char* fix_addr;
   void* p;
@@ -25,7 +25,7 @@ int main(int argc, char* argv[]) {
   breakpoint();
 
   fix_addr =
-      (char*)(((uintptr_t) & v - 256 * 1024) & ~(uintptr_t)(PAGE_SIZE - 1));
+      (char*)(((uintptr_t)&v - 256 * 1024) & ~(uintptr_t)(PAGE_SIZE - 1));
   p = mmap(fix_addr, PAGE_SIZE, PROT_READ | PROT_WRITE,
            MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   test_assert(p == fix_addr);

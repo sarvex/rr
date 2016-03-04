@@ -36,26 +36,6 @@ def write_syscall_enum_for_tests(f, arch):
     f.write("};\n")
     f.write("\n")
 
-def write_is_always_emulated_syscall(f):
-    semantics_to_retval = { syscalls.ReplaySemantics.EMU: 'true',
-                            syscalls.ReplaySemantics.EXEC: 'false',
-                            syscalls.ReplaySemantics.MAY_EXEC: 'false' }
-
-    f.write("template <typename Arch> static bool is_always_emulated_syscall_arch(int syscall);\n");
-    f.write("\n");
-    for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64")]:
-        f.write("template<> bool is_always_emulated_syscall_arch<%s>(int syscallno) {\n" % specializer)
-        f.write("  switch (syscallno) {\n")
-        for name, obj in syscalls.all():
-            f.write("    case %s::%s: return %s;\n"
-                    % (specializer, name, semantics_to_retval[obj.semantics]))
-        f.write("    default:\n")
-        f.write("      FATAL() << \"Unknown syscall \" << syscallno;\n")
-        f.write("      return true;\n")
-        f.write("  }\n")
-        f.write("}\n")
-        f.write("\n")
-
 def write_syscallname_arch(f):
     f.write("template <typename Arch> static std::string syscallname_arch(int syscall);\n")
     f.write("\n");
@@ -88,7 +68,7 @@ def write_syscall_record_cases(f):
             f.write("  case Arch::%s:\n" % name)
             for arg in range(1,6):
                 write_recorder_for_arg(obj, arg)
-            f.write("    return syscall_state.done_preparing(PREVENT_SWITCH);\n")
+            f.write("    return PREVENT_SWITCH;\n")
 
 has_syscall = string.Template("""inline bool
 has_${syscall}_syscall(SupportedArch arch) {
@@ -141,22 +121,6 @@ def write_syscall_helper_functions(f):
     for name, obj in syscalls.all():
         write_helpers(name)
 
-def write_syscall_defs_table(f):
-    for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64")]:
-        f.write("template<> syscall_defs<%s>::Table syscall_defs<%s>::table = {\n"
-                % (specializer, specializer))
-        arch_syscalls = sorted(syscalls.for_arch(arch), key=lambda x: getattr(x[1], arch))
-        for name, obj in arch_syscalls:
-            if isinstance(obj, syscalls.RegularSyscall):
-                f.write("  { %s::%s, { rep_%s } },\n"
-                        % (specializer, name, obj.semantics))
-            elif isinstance(obj, (syscalls.IrregularSyscall, syscalls.RestartSyscall)):
-                f.write("  { %s::%s, { rep_EMU } },\n" % (specializer, name))
-            elif isinstance(obj, syscalls.UnsupportedSyscall):
-                pass
-        f.write("};\n")
-        f.write("\n")
-
 def write_check_syscall_numbers(f):
     for name, obj in syscalls.all():
         # XXX hard-coded to x86 currently
@@ -168,8 +132,6 @@ def write_check_syscall_numbers(f):
 generators_for = {
     'AssemblyTemplates': lambda f: assembly_templates.generate(f),
     'CheckSyscallNumbers': write_check_syscall_numbers,
-    'IsAlwaysEmulatedSyscall': write_is_always_emulated_syscall,
-    'SyscallDefsTable': write_syscall_defs_table,
     'SyscallEnumsX86': lambda f: write_syscall_enum(f, 'x86'),
     'SyscallEnumsX64': lambda f: write_syscall_enum(f, 'x64'),
     'SyscallEnumsForTestsX86': lambda f: write_syscall_enum_for_tests(f, 'x86'),

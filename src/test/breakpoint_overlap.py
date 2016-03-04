@@ -35,14 +35,14 @@ while True:
 if eip is None:
     failed('%s not found' % regex_info[arch].ip_name)
 
-send_gdb('b *%s\n'%eip)
+send_gdb('b *%s'%eip)
 expect_gdb('Breakpoint 1')
 
-send_gdb('c\n')
+send_gdb('c')
 expect_gdb('Breakpoint 1')
-expect_gdb('(gdb)')
+expect_gdb('(rr)')
 
-send_gdb('p/x *(char*)$pc\n')
+send_gdb('p/x *(char*)$pc')
 expect_gdb('0x([a-f0-9]+)')
 
 if last_match().group(1) is 'cc':

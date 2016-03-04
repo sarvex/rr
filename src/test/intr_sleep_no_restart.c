@@ -8,22 +8,22 @@ static pid_t reader_tid;
 static int reader_caught_signal;
 
 static void intr_sleep(int secs) {
-  struct timespec req = { .tv_sec = secs };
-  struct timespec rem = { 0 };
+  struct timespec req = { secs, 0 };
+  struct timespec rem = { 0, 0 };
 
   test_assert(-1 == nanosleep(&req, &rem) && EINTR == errno);
   test_assert(rem.tv_sec > 0 || rem.tv_nsec > 0);
 }
 
 static void fin_sleep(int secs) {
-  struct timespec req = { .tv_sec = secs };
-  struct timespec rem = { .tv_sec = -1, .tv_nsec = -1 };
+  struct timespec req = { secs, 0 };
+  struct timespec rem = { -1, -1 };
 
   test_assert(0 == nanosleep(&req, &rem));
   test_assert(-1 == rem.tv_sec && -1 == rem.tv_nsec);
 }
 
-static void sighandler(int sig) {
+static void sighandler(__attribute__((unused)) int sig) {
   test_assert(sys_gettid() == reader_tid);
   ++reader_caught_signal;
 
@@ -31,7 +31,7 @@ static void sighandler(int sig) {
   intr_sleep(2);
 }
 
-static void sighandler2(int sig) {
+static void sighandler2(__attribute__((unused)) int sig) {
   test_assert(sys_gettid() == reader_tid);
   ++reader_caught_signal;
 
@@ -39,7 +39,7 @@ static void sighandler2(int sig) {
   fin_sleep(1);
 }
 
-static void* reader_thread(void* dontcare) {
+static void* reader_thread(__attribute__((unused)) void* dontcare) {
   struct sigaction act;
   int flags = 0;
 
@@ -63,7 +63,7 @@ static void* reader_thread(void* dontcare) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   struct timeval ts;
 
   /* (Kick on the syscallbuf if it's enabled.) */

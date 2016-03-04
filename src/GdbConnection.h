@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <ostream>
+#include <string>
 #include <vector>
 
 #include "GdbRegister.h"
@@ -21,6 +22,8 @@
  * namespaces).
  */
 struct GdbThreadId {
+  GdbThreadId(pid_t pid = -1, pid_t tid = -1) : pid(pid), tid(tid) {}
+
   pid_t pid;
   pid_t tid;
 
@@ -42,11 +45,15 @@ inline std::ostream& operator<<(std::ostream& o, const GdbThreadId& t) {
  * many bytes of |value| are valid, if any.
  */
 struct GdbRegisterValue {
-  enum {
-    MAX_SIZE = Registers::MAX_SIZE
-  };
+  enum { MAX_SIZE = Registers::MAX_SIZE };
   GdbRegister name;
-  uint8_t value[MAX_SIZE];
+  union {
+    uint8_t value[MAX_SIZE];
+    uint8_t value1;
+    uint16_t value2;
+    uint32_t value4;
+    uint64_t value8;
+  };
   size_t size;
   bool defined;
 };
@@ -58,7 +65,7 @@ struct GdbRegisterValue {
 struct GdbRegisterFile {
   std::vector<GdbRegisterValue> regs;
 
-  GdbRegisterFile(size_t n_regs) : regs(n_regs) {};
+  GdbRegisterFile(size_t n_regs) : regs(n_regs){};
 
   size_t total_registers() const { return regs.size(); }
 };
@@ -72,6 +79,8 @@ enum GdbRequestType {
   DREQ_GET_REGS,
   DREQ_GET_STOP_REASON,
   DREQ_GET_THREAD_LIST,
+  DREQ_INTERRUPT,
+  DREQ_DETACH,
 
   /* These use params.target. */
   DREQ_GET_AUXV,
@@ -79,10 +88,26 @@ enum GdbRequestType {
   DREQ_GET_THREAD_EXTRA_INFO,
   DREQ_SET_CONTINUE_THREAD,
   DREQ_SET_QUERY_THREAD,
+  // gdb wants to write back siginfo_t to a tracee.  More
+  // importantly, this packet arrives before an experiment
+  // session for a |call foo()| is about to be torn down.
+  //
+  // TODO: actual interface NYI.
+  DREQ_WRITE_SIGINFO,
 
   /* These use params.mem. */
   DREQ_GET_MEM,
   DREQ_SET_MEM,
+  // gdb wants to read the current siginfo_t for a stopped
+  // tracee.  More importantly, this packet arrives at the very
+  // beginning of a |call foo()| experiment.
+  //
+  // Uses .mem for offset/len.
+  DREQ_READ_SIGINFO,
+  DREQ_SEARCH_MEM,
+  DREQ_MEM_FIRST = DREQ_GET_MEM,
+  DREQ_MEM_LAST = DREQ_SEARCH_MEM,
+
   DREQ_REMOVE_SW_BREAK,
   DREQ_REMOVE_HW_BREAK,
   DREQ_REMOVE_WR_WATCH,
@@ -99,31 +124,19 @@ enum GdbRequestType {
   /* Use params.reg. */
   DREQ_GET_REG,
   DREQ_SET_REG,
+  DREQ_REG_FIRST = DREQ_GET_REG,
+  DREQ_REG_LAST = DREQ_SET_REG,
 
-  /* Use params.run_direction. */
-  DREQ_CONTINUE,
-  DREQ_INTERRUPT,
-  DREQ_STEP,
+  /* Use params.cont. */
+  DREQ_CONT,
 
   /* gdb host detaching from stub.  No parameters. */
-  DREQ_DETACH,
 
   /* Uses params.restart. */
   DREQ_RESTART,
 
-  // gdb wants to read the current siginfo_t for a stopped
-  // tracee.  More importantly, this packet arrives at the very
-  // beginning of a |call foo()| experiment.
-  //
-  // Uses .mem for offset/len.
-  DREQ_READ_SIGINFO,
-
-  // gdb wants to write back siginfo_t to a tracee.  More
-  // importantly, this packet arrives before an experiment
-  // session for a |call foo()| is about to be torn down.
-  //
-  // TODO: actual interface NYI.
-  DREQ_WRITE_SIGINFO,
+  /* Uses params.text. */
+  DREQ_RR_CMD,
 };
 
 enum GdbRestartType {
@@ -132,49 +145,119 @@ enum GdbRestartType {
   RESTART_FROM_CHECKPOINT,
 };
 
+enum GdbActionType { ACTION_CONTINUE, ACTION_STEP };
+
+struct GdbContAction {
+  GdbContAction(GdbActionType type = ACTION_CONTINUE,
+                const GdbThreadId& target = GdbThreadId::ANY,
+                int signal_to_deliver = 0)
+      : type(type), target(target), signal_to_deliver(signal_to_deliver) {}
+  GdbActionType type;
+  GdbThreadId target;
+  int signal_to_deliver;
+};
+
 /**
  * These requests are made by the debugger host and honored in proxy
  * by rr, the target.
  */
 struct GdbRequest {
-  GdbRequestType type;
+  GdbRequest(GdbRequestType type = DREQ_NONE)
+      : type(type), suppress_debugger_stop(false) {}
+  GdbRequest(const GdbRequest& other)
+      : type(other.type),
+        target(other.target),
+        suppress_debugger_stop(other.suppress_debugger_stop),
+        mem_(other.mem_),
+        watch_(other.watch_),
+        reg_(other.reg_),
+        restart_(other.restart_),
+        cont_(other.cont_),
+        text_(other.text_) {}
+  GdbRequest& operator=(const GdbRequest& other) {
+    this->~GdbRequest();
+    new (this) GdbRequest(other);
+    return *this;
+  }
+
+  const GdbRequestType type;
   GdbThreadId target;
   bool suppress_debugger_stop;
-  union {
-    struct {
-      uintptr_t addr;
-      size_t len;
-      // For SET_MEM requests, the stream of |len|
-      // number of raw bytes that are to be written.
-      const uint8_t* data;
-    } mem;
 
-    GdbRegisterValue reg;
-
-    struct {
-      int param;
-      GdbRestartType type;
-    } restart;
-
+  struct Mem {
+    uintptr_t addr;
+    size_t len;
+    // For SET_MEM requests, the |len| raw bytes that are to be written.
+    // For SEARCH_MEM requests, the bytes to search for.
+    std::vector<uint8_t> data;
+  } mem_;
+  struct Watch {
+    uintptr_t addr;
+    int kind;
+    std::vector<std::vector<uint8_t> > conditions;
+  } watch_;
+  GdbRegisterValue reg_;
+  struct Restart {
+    int param;
+    std::string param_str;
+    GdbRestartType type;
+  } restart_;
+  struct Cont {
     RunDirection run_direction;
-  };
+    std::vector<GdbContAction> actions;
+  } cont_;
+  std::string text_;
+
+  Mem& mem() {
+    assert(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
+    return mem_;
+  }
+  const Mem& mem() const {
+    assert(type >= DREQ_MEM_FIRST && type <= DREQ_MEM_LAST);
+    return mem_;
+  }
+  Watch& watch() {
+    assert(type >= DREQ_WATCH_FIRST && type <= DREQ_WATCH_LAST);
+    return watch_;
+  }
+  const Watch& watch() const {
+    assert(type >= DREQ_WATCH_FIRST && type <= DREQ_WATCH_LAST);
+    return watch_;
+  }
+  GdbRegisterValue& reg() {
+    assert(type >= DREQ_REG_FIRST && type <= DREQ_REG_LAST);
+    return reg_;
+  }
+  const GdbRegisterValue& reg() const {
+    assert(type >= DREQ_REG_FIRST && type <= DREQ_REG_LAST);
+    return reg_;
+  }
+  Restart& restart() {
+    assert(type == DREQ_RESTART);
+    return restart_;
+  }
+  const Restart& restart() const {
+    assert(type == DREQ_RESTART);
+    return restart_;
+  }
+  Cont& cont() {
+    assert(type == DREQ_CONT);
+    return cont_;
+  }
+  const Cont& cont() const {
+    assert(type == DREQ_CONT);
+    return cont_;
+  }
+  const std::string& text() const {
+    assert(type == DREQ_RR_CMD);
+    return text_;
+  }
 
   /**
    * Return nonzero if this requires that program execution be resumed
    * in some way.
    */
-  bool is_resume_request() const {
-    return type == DREQ_CONTINUE || type == DREQ_STEP;
-  }
-};
-
-/**
- * An item in a process's auxiliary vector, for example { AT_SYSINFO,
- * 0xb7fff414 }.
- */
-struct GdbAuxvPair {
-  uintptr_t key;
-  uintptr_t value;
+  bool is_resume_request() const { return type == DREQ_CONT; }
 };
 
 /**
@@ -203,10 +286,7 @@ public:
    * This function is infallible: either it will return a valid
    * debugging context, or it won't return.
    */
-  enum ProbePort {
-    DONT_PROBE = 0,
-    PROBE_PORT
-  };
+  enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
   struct Features {
     Features() : reverse_execution(true) {}
     bool reverse_execution;
@@ -221,8 +301,9 @@ public:
    * |params_pipe_fd|.  Optionally, pre-define in the gdb client the set
    * of macros defined in |macros| if nonnull.
    */
-  static void launch_gdb(ScopedFd& params_pipe_fd, const char* macros,
-                         const std::string& gdb_command_file_path);
+  static void launch_gdb(ScopedFd& params_pipe_fd, const std::string& macros,
+                         const std::string& gdb_command_file_path,
+                         const std::string& gdb_binary_file_path);
 
   /**
    * Call this when the target of |req| is needed to fulfill the
@@ -279,7 +360,7 @@ public:
    * Reply with the target thread's |auxv| pairs. |auxv.empty()|
    * if there was an error reading the auxiliary vector.
    */
-  void reply_get_auxv(const std::vector<GdbAuxvPair>& auxv);
+  void reply_get_auxv(const std::vector<uint8_t>& auxv);
 
   /**
    * |alive| is true if the requested thread is alive, false if dead.
@@ -309,6 +390,13 @@ public:
    * regardless of success/failure or special interpretation.
    */
   void reply_set_mem(bool ok);
+
+  /**
+   * Reply to the DREQ_SEARCH_MEM request.
+   * |found| is true if we found the searched-for bytes starting at address
+   * |addr|.
+   */
+  void reply_search_mem(bool found, remote_ptr<void> addr);
 
   /**
    * Reply to the DREQ_GET_OFFSETS request.
@@ -370,6 +458,11 @@ public:
   void reply_write_siginfo(/* TODO*/);
 
   /**
+   * Send a manual text response to a rr cmd (maintenance) packet.
+   */
+  void reply_rr_cmd(const std::string& text);
+
+  /**
    * Create a checkpoint of the given Session with the given id. Delete the
    * existing checkpoint with that id if there is one.
    */
@@ -386,6 +479,14 @@ public:
    * Get the checkpoint with the given id. Return null if not found.
    */
   ReplaySession::shr_ptr get_checkpoint(int checkpoint_id);
+
+  /**
+   * Return true if there's a new packet to be read/process (whether
+   * incomplete or not), and false if there isn't one.
+   */
+  bool sniff_packet();
+
+  const Features& features() { return features_; }
 
 private:
   GdbConnection(pid_t tgid, const Features& features);
@@ -417,11 +518,6 @@ private:
    * seen, false if not.
    */
   bool skip_to_packet_start();
-  /**
-   * Return true if there's a new packet to be read/process (whether
-   * incomplete or not), and false if there isn't one.
-   */
-  bool sniff_packet();
   /**
    * Block until the sequence of bytes
    *
@@ -485,7 +581,7 @@ private:
   ssize_t packetend;     /* index of '#' character */
   uint8_t outbuf[32768]; /* buffered output for gdb */
   ssize_t outlen;
-  Features features;
+  Features features_;
 };
 
 #endif /* RR_GDB_CONNECTION_H_ */

@@ -2,19 +2,40 @@
 
 #include "FdTable.h"
 
+#include <limits.h>
+
 #include <unordered_set>
 
+#include "rr/rr.h"
+
+#include "log.h"
 #include "Session.h"
 #include "task.h"
 
 using namespace std;
 
+void FdTable::add_monitor(int fd, FileMonitor* monitor) {
+  // In the future we could support multiple monitors on an fd, but we don't
+  // need to yet.
+  assert(!is_monitoring(fd));
+  fds[fd] = FileMonitor::shr_ptr(monitor);
+  update_syscallbuf_fds_disabled(fd);
+}
+
+bool FdTable::allow_close(int fd) {
+  auto it = fds.find(fd);
+  if (it == fds.end()) {
+    return true;
+  }
+  return it->second->allow_close();
+}
+
 Switchable FdTable::will_write(Task* t, int fd) {
   auto it = fds.find(fd);
-  if (it != fds.end()) {
-    return it->second->will_write(t);
+  if (it == fds.end()) {
+    return ALLOW_SWITCH;
   }
-  return ALLOW_SWITCH;
+  return it->second->will_write(t);
 }
 
 void FdTable::did_write(Task* t, int fd,
@@ -25,7 +46,7 @@ void FdTable::did_write(Task* t, int fd,
   }
 }
 
-void FdTable::dup(int from, int to) {
+void FdTable::did_dup(int from, int to) {
   if (fds.count(from)) {
     fds[to] = fds[from];
   } else {
@@ -34,7 +55,7 @@ void FdTable::dup(int from, int to) {
   update_syscallbuf_fds_disabled(to);
 }
 
-void FdTable::close(int fd) {
+void FdTable::did_close(int fd) {
   fds.erase(fd);
   update_syscallbuf_fds_disabled(fd);
 }
@@ -50,6 +71,7 @@ static bool is_fd_monitored_in_any_task(AddressSpace* vm, int fd) {
 
 void FdTable::update_syscallbuf_fds_disabled(int fd) {
   assert(fd >= 0);
+  assert(task_set().size() > 0);
 
   unordered_set<AddressSpace*> vms_updated;
   // It's possible for tasks with different VMs to share this fd table.
@@ -63,13 +85,15 @@ void FdTable::update_syscallbuf_fds_disabled(int fd) {
 
     if (!t->syscallbuf_fds_disabled_child.is_null() &&
         fd < SYSCALLBUF_FDS_DISABLED_SIZE) {
-      bool is_monitored = is_fd_monitored_in_any_task(vm, fd);
-      t->write_mem(t->syscallbuf_fds_disabled_child + fd, (char)is_monitored);
+      bool disable = is_fd_monitored_in_any_task(vm, fd);
+      t->write_mem(t->syscallbuf_fds_disabled_child + fd, (char)disable);
     }
   }
 }
 
 void FdTable::init_syscallbuf_fds_disabled(Task* t) {
+  ASSERT(t, has_task(t));
+
   if (t->syscallbuf_fds_disabled_child.is_null()) {
     return;
   }
@@ -102,6 +126,8 @@ static bool is_fd_open(Task* t, int fd) {
 }
 
 void FdTable::update_for_cloexec(Task* t, TraceTaskEvent& event) {
+  ASSERT(t, has_task(t));
+
   vector<int> fds_to_close;
 
   if (t->session().is_recording()) {
@@ -116,6 +142,6 @@ void FdTable::update_for_cloexec(Task* t, TraceTaskEvent& event) {
   }
 
   for (auto fd : fds_to_close) {
-    close(fd);
+    did_close(fd);
   }
 }

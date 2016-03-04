@@ -7,11 +7,15 @@
 #define _POSIX_C_SOURCE 2
 
 #include <arpa/inet.h>
+#include <asm/prctl.h>
 #include <assert.h>
 #include <dirent.h>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <linux/audit.h>
+#include <linux/capability.h>
 #include <linux/ethtool.h>
 #include <linux/filter.h>
 #include <linux/futex.h>
@@ -21,6 +25,7 @@
 #include <linux/random.h>
 #include <linux/seccomp.h>
 #include <linux/sockios.h>
+#include <linux/unistd.h>
 #include <linux/videodev2.h>
 #include <linux/wireless.h>
 #include <poll.h>
@@ -28,6 +33,7 @@
 #include <pty.h>
 #include <sched.h>
 #include <signal.h>
+#include <sound/asound.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -35,11 +41,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <syscall.h>
+#include <sys/file.h>
 #include <sys/xattr.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
+#include <sys/fsuid.h>
 #include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/msg.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -57,6 +67,7 @@
 #include <sys/times.h>
 #include <sys/timerfd.h>
 #include <sys/types.h>
+#include <sys/ucontext.h>
 #include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/user.h>
@@ -65,6 +76,7 @@
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
+#include <ucontext.h>
 #include <unistd.h>
 #include <utime.h>
 #include <x86intrin.h>
@@ -83,26 +95,13 @@ typedef unsigned char uint8_t;
 
 #define ALEN(_a) (sizeof(_a) / sizeof(_a[0]))
 
-#define test_assert(cond) assert("FAILED if not: " && (cond))
-
-#define check_syscall(expected, expr)                                          \
-  do {                                                                         \
-    int __result = (expr);                                                     \
-    if ((expected) != __result) {                                              \
-      atomic_printf("syscall failed: got %d, expected %d, errno %d", __result, \
-                    (expected), errno);                                        \
-      test_assert(0);                                                          \
-    }                                                                          \
-  } while (0)
-
 /**
  * Print the printf-like arguments to stdout as atomic-ly as we can
  * manage.  Async-signal-safe.  Does not flush stdio buffers (doing so
  * isn't signal safe).
  */
-__attribute__((format(printf, 1,
-                      2))) inline static int atomic_printf(const char* fmt,
-                                                           ...) {
+__attribute__((format(printf, 1, 2))) inline static int atomic_printf(
+    const char* fmt, ...) {
   va_list args;
   char buf[1024];
   int len;
@@ -125,6 +124,15 @@ inline static int atomic_puts(const char* str) {
 #define fprintf(...) USE_dont_write_stderr
 #define printf(...) USE_atomic_printf_INSTEAD
 #define puts(...) USE_atomic_puts_INSTEAD
+
+inline static int check_cond(int cond) {
+  if (!cond) {
+    atomic_printf("FAILED: errno=%d (%s)\n", errno, strerror(errno));
+  }
+  return cond;
+}
+
+#define test_assert(cond) assert("FAILED: !" && check_cond(cond))
 
 /**
  * Return the calling task's id.
@@ -180,6 +188,8 @@ inline static void free_guard(size_t size, void* p) {
   free((char*)p - sizeof(GUARD_VALUE));
 }
 
+inline static void crash_null_deref(void) { *(volatile int*)NULL = 0; }
+
 #define ALLOCATE_GUARD(p, v) p = allocate_guard(sizeof(*p), v)
 #define VERIFY_GUARD(p) verify_guard(sizeof(*p), p)
 #define FREE_GUARD(p) free_guard(sizeof(*p), p)
@@ -190,5 +200,9 @@ inline static void free_guard(size_t size, void* p) {
 #ifndef SECCOMP_SET_MODE_FILTER
 #define SECCOMP_SET_MODE_FILTER 1
 #endif
+
+/* Old systems don't have linux/kcmp.h */
+#define RR_KCMP_FILE 0
+#define RR_KCMP_FILES 2
 
 #endif /* RRUTIL_H */

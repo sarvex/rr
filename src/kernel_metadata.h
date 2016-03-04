@@ -11,35 +11,28 @@
 #include "kernel_abi.h"
 
 /**
- * Return the symbolic name of |syscall|, f.e. "read", or "???syscall"
+ * Return the symbolic name of |syscall|, f.e. "read", or "syscall(%d)"
  * if unknown.
  */
 std::string syscall_name(int syscall, SupportedArch arch);
 
 /**
  * Return the symbolic name of the PTRACE_EVENT_* |event|, or
- * "???EVENT" if unknown.
+ * "PTRACE_EVENT(%d)" if unknown.
  */
-const char* ptrace_event_name(int event);
+std::string ptrace_event_name(int event);
 
 /**
- * Return the symbolic name of the PTRACE_ |request|, or "???REQ" if
+ * Return the symbolic name of the PTRACE_ |request|, or "PTRACE_REQUEST(%d)" if
  * unknown.
  */
-const char* ptrace_req_name(int request);
+std::string ptrace_req_name(int request);
 
 /**
- * Return the symbolic name of |sig|, f.e. "SIGILL", or "???signal" if
+ * Return the symbolic name of |sig|, f.e. "SIGILL", or "signal(%d)" if
  * unknown.
  */
-const char* signal_name(int sig);
-
-/**
- * Return true iff replaying |syscall| will never ever require
- * actually executing it, i.e. replay of |syscall| is always
- * emulated.
- */
-bool is_always_emulated_syscall(int syscall, SupportedArch arch);
+std::string signal_name(int sig);
 
 /**
  * Return true if this is some kind of sigreturn syscall.
@@ -49,12 +42,12 @@ bool is_sigreturn(int syscall, SupportedArch arch);
 /**
  * Return the symbolic error name (e.g. "EINVAL") for errno.
  */
-const char* errno_name(int err);
+std::string errno_name(int err);
 
 /**
  * Return the symbolic name (e.g. "SI_USER") for an si_code.
  */
-const char* sicode_name(int code, int sig);
+std::string sicode_name(int code, int sig);
 
 /**
  * Print siginfo on ostream.

@@ -15,7 +15,7 @@ template <typename T> size_t pointer_arithmetic_size() { return sizeof(T); }
 template <> inline size_t pointer_arithmetic_size<void>() { return 1; }
 
 /**
- * A pointer in some tracee address space.
+ * A pointer to data in some tracee address space.
  * This lets us distinguish between real, usable pointers in rr's address space
  * and pointers that only make sense in a tracee address space.
  */
@@ -23,7 +23,7 @@ template <typename T> class remote_ptr {
 public:
   remote_ptr() : ptr(0) {}
   remote_ptr(uintptr_t ptr) : ptr(ptr) {}
-  remote_ptr(std::nullptr_t null) : ptr(0) {}
+  remote_ptr(std::nullptr_t) : ptr(0) {}
   template <typename U> remote_ptr(remote_ptr<U> p) : ptr(p.as_int()) {
     consume_dummy(static_cast<U*>(nullptr));
   }

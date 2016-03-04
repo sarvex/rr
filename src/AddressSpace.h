@@ -3,17 +3,23 @@
 #ifndef RR_ADDRESS_SPACE_H_
 #define RR_ADDRESS_SPACE_H_
 
+#include <assert.h>
 #include <inttypes.h>
+#include <linux/kdev_t.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <map>
 #include <memory>
 #include <set>
+#include <vector>
 
 #include "preload/preload_interface.h"
 
 #include "kernel_abi.h"
+#include "MemoryRange.h"
 #include "Monkeypatcher.h"
+#include "remote_code_ptr.h"
 #include "TaskishUid.h"
 #include "TraceStream.h"
 #include "util.h"
@@ -32,197 +38,88 @@ public:
 
   void insert_task(Task* t);
   void erase_task(Task* t);
+  bool has_task(Task* t) const { return tasks.find(t) != tasks.end(); }
 
 protected:
   TaskSet tasks;
 };
 
 /**
- * PseudoDevices aren't real disk devices, but they differentiate
- * memory mappings when we're trying to decide whether adjacent
- * FileId::NO_DEVICE mappings should be coalesced.
+ * Records information that the kernel knows about a mapping. This includes
+ * everything returned through /proc/<pid>/maps but also information that
+ * we know from observing mmap and mprotect calls.
  */
-enum PseudoDevice {
-  PSEUDODEVICE_NONE = 0,
-  PSEUDODEVICE_ANONYMOUS,
-  PSEUDODEVICE_HEAP,
-  PSEUDODEVICE_SCRATCH,
-  PSEUDODEVICE_SHARED_MMAP_FILE,
-  PSEUDODEVICE_STACK,
-  PSEUDODEVICE_SYSCALLBUF,
-  PSEUDODEVICE_VDSO,
-  PSEUDODEVICE_SYSV_SHM
-};
-
-/**
- * FileIds uniquely identify a file at a point in time (when the file
- * is stat'd).
- */
-class FileId {
+class KernelMapping : public MemoryRange {
 public:
-  static const dev_t NO_DEVICE = 0;
-  static const ino_t NO_INODE = 0;
-
-  FileId(PseudoDevice psdev = PSEUDODEVICE_NONE)
-      : device(NO_DEVICE), inode(NO_INODE), psdev(psdev) {}
-  FileId(const struct stat& st, PseudoDevice psdev = PSEUDODEVICE_NONE)
-      : device(st.st_dev), inode(st.st_ino), psdev(psdev) {}
-  FileId(dev_t dev, ino_t ino, PseudoDevice psdev = PSEUDODEVICE_NONE)
-      : device(dev), inode(ino), psdev(psdev) {}
-  FileId(dev_t dev_major, dev_t dev_minor, ino_t ino,
-         PseudoDevice psdev = PSEUDODEVICE_NONE);
-
-  /**
-   * Return the major/minor ID for the device underlying this
-   * file.  If |is_real_device()| is false, return 0
-   * (NO_DEVICE).
-   */
-  dev_t dev_major() const;
-  dev_t dev_minor() const;
-  /**
-   * Return a displayable "real" inode.  If |is_real_device()|
-   * is false, return 0 (NO_INODE).
-   */
-  ino_t disp_inode() const;
-  ino_t internal_inode() const { return inode; }
-  PseudoDevice psuedodevice() const { return psdev; }
-
-  /**
-   * Return true iff |this| and |o| are the same "real device"
-   * (i.e., same device and inode), or |this| and |o| are
-   * ANONYMOUS pseudo-devices.  Results are undefined for other
-   * pseudo-devices.
-   */
-  bool equivalent_to(const FileId& o) const {
-    if (psdev != o.psdev) {
-      return false;
-    }
-    if (psdev == PSEUDODEVICE_ANONYMOUS) {
-      return true;
-    }
-    if (psdev != PSEUDODEVICE_SYSV_SHM) {
-      if (dev_major() != o.dev_major()) {
-        return false;
-      }
-      // Allow device minor numbers to vary if the major device is
-      // 0. This was observed to be happening on
-      // "3.13.0-24-generic #46-Ubuntu SMP" in KVM with btrfs.
-      if (dev_major() != 0 && dev_minor() != o.dev_minor()) {
-        return false;
-      }
-    }
-    return inode == o.inode;
-  }
-  /**
-   * Return true if this file is/was backed by an external
-   * device, as opposed to a transient RAM mapping.
-   */
-  bool is_real_device() const {
-    return device > NO_DEVICE || psdev == PSEUDODEVICE_SYSV_SHM;
-  }
-  const char* special_name() const;
-
-  bool operator<(const FileId& o) const {
-    return psdev != o.psdev ? psdev < o.psdev : device != o.device
-                                                    ? device < o.device
-                                                    : inode < o.inode;
-  }
-
-private:
-  dev_t device;
-  ino_t inode;
-  PseudoDevice psdev;
-};
-
-/**
- * Describe the mapping of a MappableResource.  This includes the
- * offset of the mapping, its protection flags, the offest within the
- * resource, and more.
- */
-struct Mapping {
   /**
    * These are the flags we track internally to distinguish
    * between adjacent segments.  For example, the kernel
    * considers a NORESERVE anonynmous mapping that's adjacent to
    * a non-NORESERVE mapping distinct, even if all other
-   * metadata are the same.  See |is_adjacent_mapping()| in
-   * task.cc.
+   * metadata are the same.  See |is_adjacent_mapping()|.
    */
-  static const int map_flags_mask =
-      (MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_SHARED | MAP_STACK);
-  static const int checkable_flags_mask = (MAP_PRIVATE | MAP_SHARED);
+  static const int map_flags_mask = MAP_ANONYMOUS | MAP_NORESERVE |
+                                    MAP_PRIVATE | MAP_SHARED | MAP_STACK |
+                                    MAP_GROWSDOWN;
+  static const int checkable_flags_mask = MAP_PRIVATE | MAP_SHARED;
+  static const dev_t NO_DEVICE = 0;
+  static const ino_t NO_INODE = 0;
 
-  Mapping() : prot(0), flags(0), offset(0) {}
-  Mapping(remote_ptr<void> addr, size_t num_bytes, int prot = 0, int flags = 0,
-          off64_t offset = 0)
-      : start(addr),
-        end(addr + ceil_page_size(num_bytes)),
-        prot(prot),
-        flags(flags & map_flags_mask),
-        offset(offset) {
-    assert_valid();
-  }
-  Mapping(remote_ptr<void> start, remote_ptr<void> end, int prot = 0,
-          int flags = 0, off64_t offset = 0)
-      : start(start),
-        end(end),
-        prot(prot),
-        flags(flags & map_flags_mask),
+  KernelMapping() : device_(0), inode_(0), prot_(0), flags_(0), offset(0) {}
+  KernelMapping(remote_ptr<void> start, remote_ptr<void> end,
+                const std::string& fsname, dev_t device, ino_t inode, int prot,
+                int flags, off64_t offset = 0)
+      : MemoryRange(start, end),
+        fsname_(fsname),
+        device_(device),
+        inode_(inode),
+        prot_(prot),
+        flags_(flags & map_flags_mask),
         offset(offset) {
     assert_valid();
   }
 
-  Mapping(const Mapping& o)
-      : start(o.start),
-        end(o.end),
-        prot(o.prot),
-        flags(o.flags),
+  KernelMapping(const KernelMapping& o)
+      : MemoryRange(o),
+        fsname_(o.fsname_),
+        device_(o.device_),
+        inode_(o.inode_),
+        prot_(o.prot_),
+        flags_(o.flags_),
         offset(o.offset) {
     assert_valid();
   }
-  Mapping operator=(const Mapping& o) {
-    memcpy(this, &o, sizeof(*this));
-    assert_valid();
+  KernelMapping operator=(const KernelMapping& o) {
+    this->~KernelMapping();
+    new (this) KernelMapping(o);
     return *this;
   }
 
   void assert_valid() const {
-    assert(end >= start);
-    assert(num_bytes() % page_size() == 0);
-    assert(!(flags & ~map_flags_mask));
+    assert(end() >= start());
+    assert(size() % page_size() == 0);
+    assert(!(flags_ & ~map_flags_mask));
     assert(offset % page_size() == 0);
   }
 
-  /**
-   * Return true iff |o| is an address range fully contained by
-   * this.
-   */
-  bool has_subset(const Mapping& o) const {
-    return start <= o.start && o.end <= end;
+  KernelMapping extend(remote_ptr<void> end) const {
+    assert(end >= MemoryRange::end());
+    return KernelMapping(start(), end, fsname_, device_, inode_, prot_, flags_,
+                         offset);
   }
-
-  /**
-   * Return true iff |o| and this map at least one shared byte.
-   */
-  bool intersects(const Mapping& o) const {
-    return (start == o.start && o.end == end) ||
-           (start <= o.start && o.start < end) ||
-           (start < o.end && o.end <= end);
+  KernelMapping set_range(remote_ptr<void> start, remote_ptr<void> end) const {
+    return KernelMapping(start, end, fsname_, device_, inode_, prot_, flags_,
+                         offset);
   }
-
-  size_t num_bytes() const {
-    ssize_t s = end - start;
-    assert(s >= 0);
-    return s;
+  KernelMapping subrange(remote_ptr<void> start, remote_ptr<void> end) const {
+    assert(start >= MemoryRange::start() && end <= MemoryRange::end());
+    return KernelMapping(
+        start, end, fsname_, device_, inode_, prot_, flags_,
+        offset + (is_real_device() ? start - MemoryRange::start() : 0));
   }
-
-  /**
-   * Return the lowest-common-denominator interpretation of this
-   * mapping, namely, the one that can be parsed out of
-   * /proc/maps.
-   */
-  Mapping to_kernel() const {
-    return Mapping(start, end, prot, flags & checkable_flags_mask, offset);
+  KernelMapping set_prot(int prot) const {
+    return KernelMapping(start(), end(), fsname_, device_, inode_, prot, flags_,
+                         offset);
   }
 
   /**
@@ -231,28 +128,54 @@ struct Mapping {
   */
   std::string str() const {
     char str[200];
-    sprintf(str, "%8p-%8p %c%c%c%c %08" PRIx64, (void*)start.as_int(),
-            (void*)end.as_int(), (PROT_READ & prot) ? 'r' : '-',
-            (PROT_WRITE & prot) ? 'w' : '-', (PROT_EXEC & prot) ? 'x' : '-',
-            (MAP_SHARED & flags) ? 's' : 'p', offset);
-    return str;
+    sprintf(str, "%8p-%8p %c%c%c%c %08" PRIx64 " %02x:%02x %-10ld ",
+            (void*)start().as_int(), (void*)end().as_int(),
+            (PROT_READ & prot_) ? 'r' : '-', (PROT_WRITE & prot_) ? 'w' : '-',
+            (PROT_EXEC & prot_) ? 'x' : '-', (MAP_SHARED & flags_) ? 's' : 'p',
+            offset, (int)MAJOR(device()), (int)MINOR(device()), (long)inode());
+    return str + fsname();
   }
+
+  const std::string& fsname() const { return fsname_; }
+  dev_t device() const { return device_; }
+  ino_t inode() const { return inode_; }
+  int prot() const { return prot_; }
+  int flags() const { return flags_; }
+  uint64_t file_offset_bytes() const { return offset; }
 
   /**
-   * Super-dangerous! Only call this if it's guaranteed not to change
-   * the ordering of Mappings.
+   * Return true if this file is/was backed by an external
+   * device, as opposed to a transient RAM mapping.
    */
-  void update_start(remote_ptr<void> new_start) const {
-    *const_cast<remote_ptr<void>*>(&start) = new_start;
+  bool is_real_device() const { return device() > NO_DEVICE; }
+  bool is_vdso() const { return fsname() == "[vdso]"; }
+  bool is_heap() const { return fsname() == "[heap]"; }
+  bool is_stack() const { return fsname().find("[stack") == 0; }
+  bool is_vvar() const { return fsname() == "[vvar]"; }
+  bool is_vsyscall() const { return fsname() == "[vsyscall]"; }
+
+  struct stat fake_stat() const {
+    struct stat fake_stat;
+    memset(&fake_stat, 0, sizeof(fake_stat));
+    fake_stat.st_dev = device();
+    fake_stat.st_ino = inode();
+    return fake_stat;
   }
 
-  const remote_ptr<void> start;
-  const remote_ptr<void> end;
-  const int prot;
-  const int flags;
-  const off64_t offset;
+private:
+  // The kernel's name for the mapping, as per /proc/<pid>/maps. This must
+  // be exactly correct.
+  const std::string fsname_;
+  dev_t device_;
+  ino_t inode_;
+  const int prot_;
+  const int flags_;
+  const uint64_t offset;
 };
-std::ostream& operator<<(std::ostream& o, const Mapping& m);
+inline std::ostream& operator<<(std::ostream& o, const KernelMapping& m) {
+  o << m.str();
+  return o;
+}
 
 /**
  * Compare |a| and |b| so that "subset" lookups will succeed.  What
@@ -265,120 +188,18 @@ std::ostream& operator<<(std::ostream& o, const Mapping& m);
  * less than |b|'s/
  */
 struct MappingComparator {
-  bool operator()(const Mapping& a, const Mapping& b) const {
-    return a.intersects(b) ? false : a.start < b.start;
+  bool operator()(const MemoryRange& a, const MemoryRange& b) const {
+    return a.intersects(b) ? false : a.start() < b.start();
   }
 };
 
-/**
- * A resource that can be mapped into RAM.  |Mapping| represents a
- * mapping into RAM of a MappableResource.
- */
-struct MappableResource {
-  MappableResource() : id(FileId()) {}
-  MappableResource(const FileId& id) : id(id) {}
-  MappableResource(const FileId& id, const std::string& fsname)
-      : id(id), fsname(fsname) {}
-
-  bool operator==(const MappableResource& o) const {
-    return id.equivalent_to(o.id);
-  }
-  bool operator!=(const MappableResource& o) const { return !(*this == o); }
-  bool is_scratch() const { return PSEUDODEVICE_SCRATCH == id.psuedodevice(); }
-  bool is_shared_mmap_file() const {
-    return PSEUDODEVICE_SHARED_MMAP_FILE == id.psuedodevice() ||
-           PSEUDODEVICE_SYSV_SHM == id.psuedodevice();
-  }
-  bool is_stack() const { return PSEUDODEVICE_STACK == id.psuedodevice(); }
-
-  void remove_stackness() {
-    if (is_stack()) {
-      id = FileId(id.dev_major(), id.dev_minor(), id.internal_inode(),
-                  PSEUDODEVICE_ANONYMOUS);
-      fsname = "";
-    }
-  }
-
-  /**
-   * Return a representation of this resource that would be
-   * parsed from /proc/maps if this were mapped.
-   */
-  MappableResource to_kernel() const {
-    PseudoDevice psdev;
-    switch (id.psuedodevice()) {
-      case PSEUDODEVICE_STACK:
-      case PSEUDODEVICE_SCRATCH:
-      case PSEUDODEVICE_ANONYMOUS:
-        psdev = PSEUDODEVICE_ANONYMOUS;
-        break;
-      case PSEUDODEVICE_SYSV_SHM:
-        psdev = PSEUDODEVICE_SYSV_SHM;
-        break;
-      default:
-        psdev = PSEUDODEVICE_NONE;
-        break;
-    }
-
-    return MappableResource(
-        FileId(id.dev_major(), id.dev_minor(), id.disp_inode(), psdev),
-        fsname.c_str());
-  }
-
-  /**
-   * Dump a representation of |this| to a string in a format
-   * similar to the tail part of /proc/[tid]/maps. Some extra
-   * informations are put in a '()'.
-  */
-  std::string str() const {
-    char str[200];
-    sprintf(str, "%02" PRIx64 ":%02" PRIx64 " %-10ld %s %s", id.dev_major(),
-            id.dev_minor(), id.disp_inode(), fsname.c_str(), id.special_name());
-    return str;
-  }
-
-  static MappableResource anonymous() {
-    return FileId(FileId::NO_DEVICE, nr_anonymous_maps++,
-                  PSEUDODEVICE_ANONYMOUS);
-  }
-  static MappableResource heap() {
-    return MappableResource(
-        FileId(FileId::NO_DEVICE, FileId::NO_INODE, PSEUDODEVICE_HEAP),
-        "[heap]");
-  }
-  static MappableResource scratch(pid_t tid) {
-    return MappableResource(
-        FileId(FileId::NO_DEVICE, tid, PSEUDODEVICE_SCRATCH), "[scratch]");
-  }
-  static MappableResource shared_mmap_file(const TraceMappedRegion& file);
-  static MappableResource shared_mmap_anonymous(uint32_t unique_id) {
-    return MappableResource(
-        FileId(FileId::NO_DEVICE, unique_id, PSEUDODEVICE_SHARED_MMAP_FILE));
-  }
-  static MappableResource stack(pid_t tid) {
-    return MappableResource(FileId(FileId::NO_DEVICE, tid, PSEUDODEVICE_STACK),
-                            "[stack]");
-  }
-  static MappableResource syscallbuf(pid_t tid, int fd, const char* path);
-
-  FileId id;
-  /**
-   * Some name that this file may have on its underlying file
-   * system.
-   */
-  std::string fsname;
-
-  static ino_t nr_anonymous_maps;
-};
-
-enum TrapType {
-  TRAP_NONE = 0,
-  // Trap for debugger 'stepi' request.
-  TRAP_STEPI,
+enum BreakpointType {
+  BKPT_NONE = 0,
   // Trap for internal rr purposes, f.e. replaying async
   // signals.
-  TRAP_BKPT_INTERNAL,
+  BKPT_INTERNAL,
   // Trap on behalf of a debugger user.
-  TRAP_BKPT_USER,
+  BKPT_USER,
 };
 
 enum WatchType {
@@ -392,36 +213,6 @@ enum WatchType {
 enum DebugStatus {
   DS_WATCHPOINT_ANY = 0xf,
   DS_SINGLESTEP = 1 << 14,
-};
-
-/**
- * Range of memory addresses that can be used as a std::map key.
- */
-struct MemoryRange {
-  MemoryRange(remote_ptr<void> addr, size_t num_bytes)
-      : addr(addr), num_bytes(num_bytes) {}
-  MemoryRange(remote_ptr<void> addr, remote_ptr<void> end)
-      : addr(addr), num_bytes(end - addr) {}
-  MemoryRange(const MemoryRange&) = default;
-  MemoryRange& operator=(const MemoryRange&) = default;
-
-  bool operator==(const MemoryRange& o) const {
-    return addr == o.addr && num_bytes == o.num_bytes;
-  }
-  bool operator<(const MemoryRange& o) const {
-    return addr != o.addr ? addr < o.addr : num_bytes < o.num_bytes;
-  }
-
-  bool intersects(const MemoryRange& other) const {
-    remote_ptr<void> s = std::max(addr, other.addr);
-    remote_ptr<void> e = std::min(end(), other.end());
-    return s < e;
-  }
-
-  remote_ptr<void> end() const { return addr + num_bytes; }
-
-  remote_ptr<void> addr;
-  size_t num_bytes;
 };
 
 /**
@@ -445,7 +236,25 @@ class AddressSpace : public HasTaskSet {
   friend struct VerifyAddressSpace;
 
 public:
-  typedef std::map<Mapping, MappableResource, MappingComparator> MemoryMap;
+  class Mapping {
+  public:
+    Mapping(const KernelMapping& map, const KernelMapping& recorded_map)
+        : map(map), recorded_map(recorded_map) {}
+    Mapping(const Mapping&) = default;
+    Mapping() = default;
+    const Mapping& operator=(const Mapping& other) {
+      this->~Mapping();
+      new (this) Mapping(other);
+      return *this;
+    }
+
+    const KernelMapping map;
+    // The corresponding KernelMapping in the recording. During recording,
+    // equal to 'map'.
+    const KernelMapping recorded_map;
+  };
+
+  typedef std::map<MemoryRange, Mapping, MappingComparator> MemoryMap;
   typedef std::shared_ptr<AddressSpace> shr_ptr;
 
   ~AddressSpace();
@@ -464,9 +273,17 @@ public:
 
   /**
    * Change the program data break of this address space to
-   * |addr|.
+   * |addr|. Only called during recording!
    */
-  void brk(remote_ptr<void> addr);
+  void brk(remote_ptr<void> addr, int prot);
+
+  /**
+   * This can only be called during recording.
+   */
+  remote_ptr<void> current_brk() const {
+    assert(!brk_end.is_null());
+    return brk_end;
+  }
 
   /**
    * Dump a representation of |this| to stderr in a format
@@ -496,6 +313,8 @@ public:
 
   Session* session() const { return session_; }
 
+  SupportedArch arch() const;
+
   /**
    * Return the path this address space was exec()'d with.
    */
@@ -507,13 +326,27 @@ public:
    * of breakpoint set at |ip() - sizeof(breakpoint_insn)|, if
    * one exists.  Otherwise return TRAP_NONE.
    */
-  TrapType get_breakpoint_type_for_retired_insn(remote_ptr<uint8_t> ip);
+  BreakpointType get_breakpoint_type_for_retired_insn(remote_code_ptr ip);
 
   /**
    * Return the type of breakpoint that's been registered for
    * |addr|.
    */
-  TrapType get_breakpoint_type_at_addr(remote_ptr<uint8_t> addr);
+  BreakpointType get_breakpoint_type_at_addr(remote_code_ptr addr);
+
+  /**
+   * Returns true when the breakpoint at |addr| is in private
+   * non-writeable memory. When this returns true, the breakpoint can't be
+   * overwritten by the tracee without an intervening mprotect or mmap
+   * syscall.
+   */
+  bool is_breakpoint_in_private_read_only_memory(remote_code_ptr addr);
+
+  /**
+   * Return true if there's a breakpoint instruction at |ip|. This might
+   * be an explicit instruction, even if there's no breakpoint set via our API.
+   */
+  bool is_breakpoint_instruction(Task* t, remote_code_ptr ip);
 
   /**
    * The buffer |dest| of length |length| represents the contents of tracee
@@ -526,16 +359,22 @@ public:
   /**
    * Map |num_bytes| into this address space at |addr|, with
    * |prot| protection and |flags|.  The pages are (possibly
-   * initially) backed starting at |offset| of |res|.
+   * initially) backed starting at |offset| of |res|. |fsname|, |device| and
+   * |inode| are values that will appear in the /proc/<pid>/maps entry.
+   * |*recorded_map| is the mapping during recording, or null if the mapping
+   * during recording is known to be the same as the new map (e.g. because
+   * we are recording!).
    */
-  void map(remote_ptr<void> addr, size_t num_bytes, int prot, int flags,
-           off64_t offset_bytes, const MappableResource& res);
+  KernelMapping map(remote_ptr<void> addr, size_t num_bytes, int prot,
+                    int flags, off64_t offset_bytes, const std::string& fsname,
+                    dev_t device, ino_t inode,
+                    const KernelMapping* recorded_map = nullptr);
 
   /**
    * Return the mapping and mapped resource for the byte at address 'addr'.
    * There must be such a mapping.
    */
-  MemoryMap::value_type mapping_of(remote_ptr<void> addr) const;
+  const Mapping& mapping_of(remote_ptr<void> addr) const;
 
   /**
    * Return true if there is some mapping for the byte at 'addr'.
@@ -543,15 +382,66 @@ public:
   bool has_mapping(remote_ptr<void> addr) const;
 
   /**
-   * Return the memory map.
+   * Object that generates robust iterators through the memory map. The
+   * memory map can be updated without invalidating iterators, as long as
+   * Mappings are not added or removed.
    */
-  const MemoryMap& memmap() const { return mem; }
+  class Maps {
+  public:
+    Maps(const AddressSpace& outer, remote_ptr<void> start)
+        : outer(outer), start(start) {}
+    class iterator {
+    public:
+      iterator(const iterator& it) = default;
+      const iterator& operator++() {
+        ptr = to_it()->second.map.end();
+        return *this;
+      }
+      bool operator==(const iterator& other) const {
+        return to_it() == other.to_it();
+      }
+      bool operator!=(const iterator& other) const { return !(*this == other); }
+      const Mapping* operator->() const { return &to_it()->second; }
+      Mapping operator*() const { return to_it()->second; }
+      iterator& operator=(const iterator& other) {
+        this->~iterator();
+        new (this) iterator(other);
+        return *this;
+      }
+
+    private:
+      friend class Maps;
+      iterator(const MemoryMap& outer, remote_ptr<void> ptr)
+          : outer(outer), ptr(ptr), at_end(false) {}
+      iterator(const MemoryMap& outer) : outer(outer), at_end(true) {}
+      MemoryMap::const_iterator to_it() const {
+        return at_end ? outer.end() : outer.lower_bound(MemoryRange(ptr, ptr));
+      }
+      const MemoryMap& outer;
+      remote_ptr<void> ptr;
+      bool at_end;
+    };
+    iterator begin() const { return iterator(outer.mem, start); }
+    iterator end() const { return iterator(outer.mem); }
+
+  private:
+    const AddressSpace& outer;
+    remote_ptr<void> start;
+  };
+  friend class Maps;
+  Maps maps() const { return Maps(*this, remote_ptr<void>()); }
+  Maps maps_starting_at(remote_ptr<void> start) { return Maps(*this, start); }
 
   /**
    * Change the protection bits of [addr, addr + num_bytes) to
    * |prot|.
    */
   void protect(remote_ptr<void> addr, size_t num_bytes, int prot);
+
+  /**
+   * Fix up mprotect registers parameters to take account of PROT_GROWSDOWN.
+   */
+  void fixup_mprotect_growsdown_parameters(Task* t);
 
   /**
    * Move the mapping [old_addr, old_addr + old_num_bytes) to
@@ -564,8 +454,8 @@ public:
    * Notify that the stack segment 'mapping' has grown down to a new start
    * address.
    */
-  void fix_stack_segment_start(const Mapping& mapping,
-                               remote_ptr<void> new_start);
+  KernelMapping fix_stack_segment_start(const MemoryRange& mapping,
+                                        remote_ptr<void> new_start);
 
   /**
    * Notify that data was written to this address space by rr or
@@ -574,13 +464,13 @@ public:
   void notify_written(remote_ptr<void> addr, size_t num_bytes);
 
   /** Ensure a breakpoint of |type| is set at |addr|. */
-  bool add_breakpoint(remote_ptr<uint8_t> addr, TrapType type);
+  bool add_breakpoint(remote_code_ptr addr, BreakpointType type);
   /**
    * Remove a |type| reference to the breakpoint at |addr|.  If
    * the removed reference was the last, the breakpoint is
    * destroyed.
    */
-  void remove_breakpoint(remote_ptr<uint8_t> addr, TrapType type);
+  void remove_breakpoint(remote_code_ptr addr, BreakpointType type);
   /**
    * Destroy all breakpoints in this VM, regardless of their
    * reference counts.
@@ -596,9 +486,7 @@ public:
   void remove_watchpoint(remote_ptr<void> addr, size_t num_bytes,
                          WatchType type);
   void remove_all_watchpoints();
-  std::vector<WatchConfig> all_watchpoints() {
-    return get_watch_configs(NOT_SETTING_TASK_STATE, ALL_WATCHPOINTS);
-  }
+  std::vector<WatchConfig> all_watchpoints();
 
   /**
    * Save all watchpoint state onto a stack.
@@ -611,22 +499,30 @@ public:
 
   /**
    * Notify that at least one watchpoint was hit --- recheck them all.
+   * Returns true if any watchpoint actually triggered. Note that
+   * debug_status can indicate a hit watchpoint that doesn't actually
+   * trigger, because the value of a write-watchpoint did not change.
+   * Likewise, debug_status can indicate a watchpoint wasn't hit that
+   * actually was (because in some configurations, e.g. VMWare
+   * hypervisor with 32-bit x86 guest, debug_status watchpoint bits
+   * are known to not be set on singlestep).
    */
-  void notify_watchpoint_fired(uintptr_t debug_status);
+  bool notify_watchpoint_fired(uintptr_t debug_status);
+  /**
+   * Return true if any watchpoint has fired. Will keep returning true until
+   * consume_watchpoint_changes() is called.
+   */
+  bool has_any_watchpoint_changes();
+  /**
+   * Return true if an EXEC watchpoint has fired at addr since the lsat
+   * consume_watchpoint_changes.
+   */
+  bool has_exec_watchpoint_fired(remote_code_ptr addr);
+
   /**
    * Return all changed watchpoints in |watches| and clear their changed flags.
    */
   std::vector<WatchConfig> consume_watchpoint_changes();
-
-  /**
-   * Replace all our user breakpoints with the user breakpoints of 'o'.
-   * Asserts that there are no internal breakpoints currently set.
-   */
-  void copy_user_breakpoints_from(const AddressSpace& o);
-  /**
-   * Replace all our watchpoints with the watchpoints of 'o'.
-   */
-  void copy_watchpoints_from(const AddressSpace& o);
 
   /**
    * Make [addr, addr + num_bytes) inaccesible within this
@@ -634,17 +530,19 @@ public:
    */
   void unmap(remote_ptr<void> addr, ssize_t num_bytes);
 
+  /**
+   * Notification of madvise call.
+   */
+  void advise(remote_ptr<void> addr, ssize_t num_bytes, int advice);
+
   /** Return the vdso mapping of this. */
-  Mapping vdso() const;
+  KernelMapping vdso() const;
 
   /**
    * Verify that this cached address space matches what the
    * kernel thinks it should be.
    */
   void verify(Task* t) const;
-
-  void for_all_mappings(
-      std::function<void(const Mapping& m, const MappableResource& r)> f);
 
   bool has_breakpoints() { return !breakpoints.empty(); }
   bool has_watchpoints() { return !watchpoints.empty(); }
@@ -655,18 +553,23 @@ public:
   ScopedFd& mem_fd() { return child_mem_fd; }
   void set_mem_fd(ScopedFd&& fd) { child_mem_fd = std::move(fd); }
 
-  Monkeypatcher& monkeypatcher() { return monkeypatch_state; }
+  Monkeypatcher& monkeypatcher() {
+    assert(monkeypatch_state);
+    return *monkeypatch_state;
+  }
 
+  /**
+   * Call this only during recording.
+   */
   void at_preload_init(Task* t);
 
   /* The address of the syscall instruction from which traced syscalls made by
    * the syscallbuf will originate. */
-  remote_ptr<uint8_t> traced_syscall_ip() const { return traced_syscall_ip_; }
-  /* The address of the syscall instruction from which untraced syscalls will
-   * originate, used to determine whether a syscall is being
-   * made by the syscallbuf wrappers or not. */
-  remote_ptr<uint8_t> untraced_syscall_ip() const {
-    return untraced_syscall_ip_;
+  remote_code_ptr traced_syscall_ip() const { return traced_syscall_ip_; }
+  /* The address of the syscall instruction from which privileged traced
+   * syscalls made by the syscallbuf will originate. */
+  remote_code_ptr privileged_traced_syscall_ip() const {
+    return privileged_traced_syscall_ip_;
   }
   /* Start and end of the mapping of the syscallbuf code
    * section, used to determine whether a tracee's $ip is in the
@@ -695,29 +598,68 @@ public:
    * ip() when we're in an untraced system call; same for all supported
    * architectures (hence static).
    */
-  static remote_ptr<uint8_t> rr_page_ip_in_untraced_syscall() {
+  static remote_code_ptr rr_page_ip_in_untraced_syscall() {
     return RR_PAGE_IN_UNTRACED_SYSCALL_ADDR;
+  }
+  /**
+   * ip() when we're in an untraced replayed system call; same for all supported
+   * architectures (hence static).
+   */
+  static remote_code_ptr rr_page_ip_in_untraced_replayed_syscall() {
+    return RR_PAGE_IN_UNTRACED_REPLAYED_SYSCALL_ADDR;
   }
   /**
    * This doesn't need to be the same for all architectures, but may as well
    * make it so.
    */
-  static remote_ptr<uint8_t> rr_page_ip_in_traced_syscall() {
+  static remote_code_ptr rr_page_ip_in_traced_syscall() {
     return RR_PAGE_IN_TRACED_SYSCALL_ADDR;
   }
   /**
+   * ip() when we're in an untraced system call; same for all supported
+   * architectures (hence static).
+   */
+  static remote_code_ptr rr_page_ip_in_privileged_untraced_syscall() {
+    return RR_PAGE_IN_PRIVILEGED_UNTRACED_SYSCALL_ADDR;
+  }
+  /**
+   * This doesn't need to be the same for all architectures, but may as well
+   * make it so.
+   */
+  static remote_code_ptr rr_page_ip_in_privileged_traced_syscall() {
+    return RR_PAGE_IN_PRIVILEGED_TRACED_SYSCALL_ADDR;
+  }
+  /**
+   * Return a pointer to 8 bytes of 0xFF
+   */
+  static remote_ptr<uint8_t> rr_page_ff_bytes() { return RR_PAGE_FF_BYTES; }
+  /**
    * ip() of the untraced traced system call instruction.
    */
-  remote_ptr<uint8_t> rr_page_untraced_syscall_ip(SupportedArch arch) {
-    return rr_page_ip_in_untraced_syscall() -
-           rr::syscall_instruction_length(arch);
+  remote_code_ptr rr_page_untraced_syscall_ip(SupportedArch arch) {
+    return rr_page_ip_in_untraced_syscall().decrement_by_syscall_insn_length(
+        arch);
   }
   /**
    * ip() of the traced traced system call instruction.
    */
-  remote_ptr<uint8_t> rr_page_traced_syscall_ip(SupportedArch arch) {
-    return rr_page_ip_in_traced_syscall() -
-           rr::syscall_instruction_length(arch);
+  remote_code_ptr rr_page_traced_syscall_ip(SupportedArch arch) {
+    return rr_page_ip_in_traced_syscall().decrement_by_syscall_insn_length(
+        arch);
+  }
+  /**
+   * ip() of the privileged untraced traced system call instruction.
+   */
+  remote_code_ptr rr_page_privileged_untraced_syscall_ip(SupportedArch arch) {
+    return rr_page_ip_in_privileged_untraced_syscall()
+        .decrement_by_syscall_insn_length(arch);
+  }
+  /**
+   * ip() of the privileged traced traced system call instruction.
+   */
+  remote_code_ptr rr_page_privileged_traced_syscall_ip(SupportedArch arch) {
+    return rr_page_ip_in_privileged_traced_syscall()
+        .decrement_by_syscall_insn_length(arch);
   }
 
   /**
@@ -726,32 +668,59 @@ public:
    * a syscall instruction into executable tracee memory (which might not be
    * possible with some kernels, e.g. PaX).
    */
-  remote_ptr<uint8_t> find_syscall_instruction(Task* t);
+  remote_code_ptr find_syscall_instruction(Task* t);
+
+  /**
+   * Task |t| just forked from this address space. Apply dont_fork settings.
+   */
+  void did_fork_into(Task* t);
+
+  void set_first_run_event(TraceFrame::Time event) { first_run_event_ = event; }
+  TraceFrame::Time first_run_event() { return first_run_event_; }
+
+  const std::vector<uint8_t>& saved_auxv() { return saved_auxv_; }
+  void save_auxv(Task* t);
+
+  /**
+   * Reads the /proc/<pid>/maps entry for a specific address. Does no caching.
+   * If performed on a file in a btrfs file system, this may return the
+   * wrong device number! If you stick to anonymous or special file
+   * mappings, this should be OK.
+   */
+  KernelMapping read_kernel_mapping(Task* t, remote_ptr<void> addr);
+
+  static uint32_t chaos_mode_min_stack_size() { return 8 * 1024 * 1024; }
+
+  remote_ptr<void> chaos_mode_find_free_memory(Task* t, size_t len);
 
 private:
-  class Breakpoint;
-  typedef std::map<remote_ptr<uint8_t>, Breakpoint> BreakpointMap;
+  struct Breakpoint;
+  typedef std::map<remote_code_ptr, Breakpoint> BreakpointMap;
   class Watchpoint;
 
   AddressSpace(Task* t, const std::string& exe, uint32_t exec_count);
-  AddressSpace(Task* t, const AddressSpace& o, uint32_t exec_count);
+  AddressSpace(Session* session, const AddressSpace& o, pid_t leader_tid,
+               uint32_t leader_serial, uint32_t exec_count);
+  /**
+   * After an exec, populate the new address space of |t| with
+   * the existing mappings we find in /proc/maps.
+   */
+  void populate_address_space(Task* t);
 
+  void unmap_internal(remote_ptr<void> addr, ssize_t num_bytes);
+
+  // Also sets brk_ptr.
   void map_rr_page(Task* t);
 
   bool update_watchpoint_value(const MemoryRange& range,
                                Watchpoint& watchpoint);
   void update_watchpoint_values(remote_ptr<void> start, remote_ptr<void> end);
+  enum WatchpointFilter { ALL_WATCHPOINTS, CHANGED_WATCHPOINTS };
+  std::vector<WatchConfig> get_watchpoints_internal(WatchpointFilter filter);
 
-  enum WillSetTaskState {
-    SETTING_TASK_STATE,
-    NOT_SETTING_TASK_STATE
-  };
-  enum WatchFilter {
-    ALL_WATCHPOINTS,
-    CHANGED_WATCHPOINTS
-  };
+  enum WillSetTaskState { SETTING_TASK_STATE, NOT_SETTING_TASK_STATE };
   std::vector<WatchConfig> get_watch_configs(
-      WillSetTaskState will_set_task_state, WatchFilter filter);
+      WillSetTaskState will_set_task_state);
 
   /**
    * Construct a minimal set of watchpoints to be enabled based
@@ -784,35 +753,25 @@ private:
    * contiguous mapping after |addr| within the region is seen.
    * Default is to iterate all mappings in the region.
    */
-  enum {
-    ITERATE_DEFAULT,
-    ITERATE_CONTIGUOUS
-  };
+  enum { ITERATE_DEFAULT, ITERATE_CONTIGUOUS };
   void for_each_in_range(
       remote_ptr<void> addr, ssize_t num_bytes,
-      std::function<void(const Mapping& m, const MappableResource& r,
-                         const Mapping& rem)> f,
+      std::function<void(const Mapping& m, const MemoryRange& rem)> f,
       int how = ITERATE_DEFAULT);
 
   /**
    * Map |m| of |r| into this address space, and coalesce any
    * mappings of |r| that are adjacent to |m|.
    */
-  void map_and_coalesce(const Mapping& m, const MappableResource& r);
+  void map_and_coalesce(const KernelMapping& m,
+                        const KernelMapping& recorded_map);
 
-  /** Set the dynamic heap segment to |[start, end)| */
-  void update_heap(remote_ptr<void> start, remote_ptr<void> end) {
-    heap = Mapping(start, end, PROT_READ | PROT_WRITE,
-                   MAP_ANONYMOUS | MAP_PRIVATE, 0);
-  }
-
+  /**
+   * Call this only during recording.
+   */
   template <typename Arch> void at_preload_init_arch(Task* t);
 
-  enum {
-    EXEC_BIT = 1 << 0,
-    READ_BIT = 1 << 1,
-    WRITE_BIT = 1 << 2
-  };
+  enum { EXEC_BIT = 1 << 0, READ_BIT = 1 << 1, WRITE_BIT = 1 << 2 };
 
   /** Return the access bits above needed to watch |type|. */
   static int access_bits_of(WatchType type);
@@ -833,24 +792,24 @@ private:
     // are valid.
     ~Breakpoint() { assert(internal_count >= 0 && user_count >= 0); }
 
-    void ref(TrapType which) {
+    void ref(BreakpointType which) {
       assert(internal_count >= 0 && user_count >= 0);
       ++*counter(which);
     }
-    int unref(TrapType which) {
+    int unref(BreakpointType which) {
       assert(internal_count > 0 || user_count > 0);
       --*counter(which);
       assert(internal_count >= 0 && user_count >= 0);
       return internal_count + user_count;
     }
 
-    TrapType type() const {
+    BreakpointType type() const {
       // NB: USER breakpoints need to be processed before
       // INTERNAL ones.  We want to give the debugger a
       // chance to dispatch commands before we attend to the
       // internal rr business.  So if there's a USER "ref"
       // on the breakpoint, treat it as a USER breakpoint.
-      return user_count > 0 ? TRAP_BKPT_USER : TRAP_BKPT_INTERNAL;
+      return user_count > 0 ? BKPT_USER : BKPT_INTERNAL;
     }
 
     size_t data_length() { return 1; }
@@ -866,9 +825,9 @@ private:
                       sizeof(AddressSpace::breakpoint_insn),
                   "Must have the same size.");
 
-    int* counter(TrapType which) {
-      assert(TRAP_BKPT_INTERNAL == which || TRAP_BKPT_USER == which);
-      int* p = TRAP_BKPT_USER == which ? &user_count : &internal_count;
+    int* counter(BreakpointType which) {
+      assert(BKPT_INTERNAL == which || BKPT_USER == which);
+      int* p = BKPT_USER == which ? &user_count : &internal_count;
       assert(*p >= 0);
       return p;
     }
@@ -887,9 +846,6 @@ private:
         : exec_count(0),
           read_count(0),
           write_count(0),
-          in_register_exec(-1),
-          in_register_readwrite(-1),
-          in_register_write(-1),
           value_bytes(num_bytes),
           valid(false),
           changed(false) {}
@@ -932,7 +888,11 @@ private:
     // been cleared.  We track refcounts of each watchable access
     // separately.
     int exec_count, read_count, write_count;
-    int8_t in_register_exec, in_register_readwrite, in_register_write;
+    // Debug registers allocated for read/exec access checking.
+    // Write watchpoints are always triggered by checking for actual memory
+    // value changes. Read/exec watchpoints can't be triggered that way, so
+    // we look for these registers being triggered instead.
+    std::vector<int8_t> debug_regs_for_exec_read;
     std::vector<uint8_t> value_bytes;
     bool valid;
     bool changed;
@@ -940,7 +900,7 @@ private:
 
   // All breakpoints set in this VM.
   BreakpointMap breakpoints;
-  /* Path of the executable image this address space was
+  /* Path of the real executable image this address space was
    * exec()'d with. */
   std::string exe;
   /* Pid of first task for this address space */
@@ -948,20 +908,23 @@ private:
   /* Serial number of first task for this address space */
   uint32_t leader_serial;
   uint32_t exec_count;
-  /* Track the special process-global heap in order to support
-   * adjustments by brk(). */
-  Mapping heap;
+  // Only valid during recording
+  remote_ptr<void> brk_start;
+  /* Current brk. Not necessarily page-aligned. */
+  remote_ptr<void> brk_end;
   /* Were we cloned from another address space? */
   bool is_clone;
   /* All segments mapped into this address space. */
   MemoryMap mem;
+  /* madvise DONTFORK regions */
+  std::set<MemoryRange> dont_fork;
   // The session that created this.  We save a ref to it so that
   // we can notify it when we die.
   Session* session_;
   /* First mapped byte of the vdso. */
   remote_ptr<void> vdso_start_addr;
   // The monkeypatcher that's handling this address space.
-  Monkeypatcher monkeypatch_state;
+  std::unique_ptr<Monkeypatcher> monkeypatch_state;
   // The watchpoints set for tasks in this VM.  Watchpoints are
   // programmed per Task, but we track them per address space on
   // behalf of debuggers that assume that model.
@@ -977,10 +940,18 @@ private:
   // Users of child_mem_fd should fall back to ptrace-based memory
   // access when child_mem_fd is not open.
   ScopedFd child_mem_fd;
-  remote_ptr<uint8_t> traced_syscall_ip_;
-  remote_ptr<uint8_t> untraced_syscall_ip_;
+  remote_code_ptr traced_syscall_ip_;
+  remote_code_ptr privileged_traced_syscall_ip_;
   remote_ptr<void> syscallbuf_lib_start_;
   remote_ptr<void> syscallbuf_lib_end_;
+
+  std::vector<uint8_t> saved_auxv_;
+
+  /**
+   * The time of the first event that ran code for a task in this address space.
+   * 0 if no such event has occurred.
+   */
+  TraceFrame::Time first_run_event_;
 
   /**
    * For each architecture, the offset of a syscall instruction with that
@@ -994,13 +965,6 @@ private:
    * as possible given the data available from /proc/maps.
    */
   static void check_segment_iterator(void* vasp, Task* t,
-                                     const struct map_iterator_data* data);
-
-  /**
-   * After an exec, populate the new address space of |t| with
-   * the existing mappings we find in /proc/maps.
-   */
-  static void populate_address_space(void* asp, Task* t,
                                      const struct map_iterator_data* data);
 
   AddressSpace operator=(const AddressSpace&) = delete;

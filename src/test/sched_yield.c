@@ -2,10 +2,7 @@
 
 #include "rrutil.h"
 
-enum {
-  PING,
-  PONG
-} last;
+enum { PING, PONG } last;
 
 pthread_once_t init_once = PTHREAD_ONCE_INIT;
 static void init_ping(void) { last = PONG; }
@@ -52,7 +49,7 @@ static void ping_pong(int which) {
   }
 }
 
-static void* pong_thread(void* unused) {
+static void* pong_thread(__attribute__((unused)) void* unused) {
   ping_pong(PONG);
   return NULL;
 }

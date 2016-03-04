@@ -7,11 +7,15 @@
 
 #include "util.h"
 
+#include <algorithm>
+
 #include <assert.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <linux/magic.h>
+#include <linux/prctl.h>
 #include <string.h>
 #include <stdlib.h>
 #include <sys/vfs.h>
@@ -19,11 +23,14 @@
 
 #include "preload/preload_interface.h"
 
+#include "AddressSpace.h"
+#include "AutoRemoteSyscalls.h"
 #include "Flags.h"
 #include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "ReplaySession.h"
+#include "seccomp-bpf.h"
 #include "task.h"
 #include "TraceStream.h"
 
@@ -118,7 +125,7 @@ void format_dump_filename(Task* t, TraceFrame::Time global_time,
            t->rec_tid, global_time, tag);
 }
 
-bool should_dump_memory(Task* t, const TraceFrame& f) {
+bool should_dump_memory(const TraceFrame& f) {
   const Flags* flags = &Flags::get();
 
 #if defined(FIRST_INTERESTING_EVENT)
@@ -145,21 +152,18 @@ void dump_process_memory(Task* t, TraceFrame::Time global_time,
   dump_file = fopen64(filename, "w");
 
   const AddressSpace& as = *(t->vm());
-  for (auto& kv : as.memmap()) {
-    const Mapping& first = kv.first;
-    const MappableResource& second = kv.second;
+  for (auto m : as.maps()) {
     vector<uint8_t> mem;
-    mem.resize(first.num_bytes());
+    mem.resize(m.map.size());
 
     ssize_t mem_len =
-        t->read_bytes_fallible(first.start, first.num_bytes(), mem.data());
+        t->read_bytes_fallible(m.map.start(), m.map.size(), mem.data());
     mem_len = max(ssize_t(0), mem_len);
 
-    string label = first.str() + ' ' + second.str();
-
-    if (!is_start_of_scratch_region(t, first.start)) {
-      dump_binary_chunk(dump_file, label.c_str(), (const uint32_t*)mem.data(),
-                        mem_len / sizeof(uint32_t), first.start);
+    if (!is_start_of_scratch_region(t, m.map.start())) {
+      dump_binary_chunk(dump_file, m.map.str().c_str(),
+                        (const uint32_t*)mem.data(), mem_len / sizeof(uint32_t),
+                        m.map.start());
     }
   }
   fclose(dump_file);
@@ -208,35 +212,31 @@ static void notify_checksum_error(Task* t, TraceFrame::Time global_time,
  * checksums.  The iterator data determines which behavior the helper
  * function takes on, and to/from which file it writes/read.
  */
-enum ChecksumMode {
-  STORE_CHECKSUMS,
-  VALIDATE_CHECKSUMS
-};
+enum ChecksumMode { STORE_CHECKSUMS, VALIDATE_CHECKSUMS };
 struct checksum_iterator_data {
   ChecksumMode mode;
   FILE* checksums_file;
   TraceFrame::Time global_time;
 };
 
-static bool checksum_segment_filter(const Mapping& m,
-                                    const MappableResource& r) {
+static bool checksum_segment_filter(const AddressSpace::Mapping& m) {
   struct stat st;
   int may_diverge;
 
-  if (stat(r.fsname.c_str(), &st)) {
+  if (stat(m.map.fsname().c_str(), &st)) {
     /* If there's no persistent resource backing this
      * mapping, we should expect it to change. */
-    LOG(debug) << "CHECKSUMMING unlinked '" << r.fsname << "'";
+    LOG(debug) << "CHECKSUMMING unlinked '" << m.map.fsname() << "'";
     return true;
   }
   /* If we're pretty sure the backing resource is effectively
    * immutable, skip checksumming, it's a waste of time.  Except
    * if the mapping is mutable, for example the rw data segment
    * of a system library, then it's interesting. */
-  may_diverge = should_copy_mmap_region(r.fsname, &st, m.prot, m.flags) ||
-                (PROT_WRITE & m.prot);
+  may_diverge =
+      should_copy_mmap_region(m.map, st) || (PROT_WRITE & m.map.prot());
   LOG(debug) << (may_diverge ? "CHECKSUMMING" : "  skipping") << " '"
-             << r.fsname << "'";
+             << m.map.fsname() << "'";
   return may_diverge;
 }
 
@@ -262,17 +262,14 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
   }
 
   const AddressSpace& as = *(t->vm());
-  for (auto& kv : as.memmap()) {
-    const Mapping& first = kv.first;
-    const MappableResource& second = kv.second;
-
+  for (auto m : as.maps()) {
     vector<uint8_t> mem;
     ssize_t valid_mem_len = 0;
 
-    if (checksum_segment_filter(first, second)) {
-      mem.resize(first.num_bytes());
+    if (checksum_segment_filter(m)) {
+      mem.resize(m.map.size());
       valid_mem_len =
-          t->read_bytes_fallible(first.start, first.num_bytes(), mem.data());
+          t->read_bytes_fallible(m.map.start(), m.map.size(), mem.data());
       valid_mem_len = max(ssize_t(0), valid_mem_len);
     }
 
@@ -280,7 +277,7 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
     unsigned checksum = 0;
     int i;
 
-    if (second.fsname.find(SYSCALLBUF_SHMEM_PATH_PREFIX) != string::npos) {
+    if (m.map.fsname().find(SYSCALLBUF_SHMEM_PATH_PREFIX) == 0) {
       /* The syscallbuf consists of a region that's written
       * deterministically wrt the trace events, and a
       * region that's written nondeterministically in the
@@ -293,7 +290,7 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
       *
       * So here, we set things up so that we only checksum
       * the deterministic region. */
-      auto child_hdr = first.start.cast<struct syscallbuf_hdr>();
+      auto child_hdr = m.map.start().cast<struct syscallbuf_hdr>();
       auto hdr = t->read_mem(child_hdr);
       valid_mem_len = !buf ? 0 : sizeof(hdr) + hdr.num_rec_bytes +
                                      sizeof(struct syscallbuf_record);
@@ -304,7 +301,7 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
       checksum += buf[i];
     }
 
-    string raw_map_line = first.str() + ' ' + second.str();
+    string raw_map_line = m.map.str();
     if (STORE_CHECKSUMS == c.mode) {
       fprintf(c.checksums_file, "(%x) %s\n", checksum, raw_map_line.c_str());
     } else {
@@ -321,9 +318,9 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
       remote_ptr<void> rec_end_addr = rec_end;
       ASSERT(t, 3 == nparsed) << "Only parsed " << nparsed << " items";
 
-      ASSERT(t, rec_start_addr == first.start && rec_end_addr == first.end)
+      ASSERT(t, rec_start_addr == m.map.start() && rec_end_addr == m.map.end())
           << "Segment " << rec_start_addr << "-" << rec_end_addr
-          << " changed to " << first << "??";
+          << " changed to " << m.map << "??";
 
       if (is_start_of_scratch_region(t, rec_start_addr)) {
         /* Replay doesn't touch scratch regions, so
@@ -345,7 +342,7 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
   fclose(c.checksums_file);
 }
 
-bool should_checksum(Task* t, const TraceFrame& f) {
+bool should_checksum(const TraceFrame& f) {
   int checksum = Flags::get().checksum;
   bool is_syscall_exit = EV_SYSCALL == f.event().type() &&
                          EXITING_SYSCALL == f.event().Syscall().state;
@@ -381,7 +378,7 @@ void validate_process_memory(Task* t, TraceFrame::Time global_time) {
 }
 
 signal_action default_action(int sig) {
-  if (SIGRTMIN <= sig && sig <= SIGRTMAX) {
+  if (32 <= sig && sig <= 64) {
     return TERMINATE;
   }
   switch (sig) {
@@ -457,27 +454,6 @@ SignalDeterministic is_deterministic_signal(const siginfo_t& si) {
   }
 }
 
-bool possibly_destabilizing_signal(Task* t, int sig,
-                                   SignalDeterministic deterministic) {
-  signal_action action = default_action(sig);
-  if (action != DUMP_CORE && action != TERMINATE) {
-    // If the default action doesn't kill the process, it won't die.
-    return false;
-  }
-
-  if (t->is_sig_ignored(sig)) {
-    // Deterministic fatal signals can't be ignored.
-    return deterministic == DETERMINISTIC_SIG;
-  }
-  if (!t->signal_has_user_handler(sig)) {
-    // The default action is going to happen: killing the process.
-    return true;
-  }
-  // If the signal's blocked, user handlers aren't going to run and the process
-  // will die.
-  return t->is_sig_blocked(sig);
-}
-
 static bool has_fs_name(const string& path) {
   struct stat dummy;
   return 0 == stat(path.c_str(), &dummy);
@@ -487,14 +463,16 @@ static bool is_tmp_file(const string& path) {
   struct statfs sfs;
   statfs(path.c_str(), &sfs);
   return (TMPFS_MAGIC == sfs.f_type
-                         // In observed configurations of Ubuntu 13.10, /tmp is
-                         // a folder in the / fs, not a separate tmpfs.
-          ||
-          path.c_str() == strstr(path.c_str(), "/tmp/"));
+          // In observed configurations of Ubuntu 13.10, /tmp is
+          // a folder in the / fs, not a separate tmpfs.
+          || path.c_str() == strstr(path.c_str(), "/tmp/"));
 }
 
-bool should_copy_mmap_region(const string& file_name, const struct stat* stat,
-                             int prot, int flags) {
+bool should_copy_mmap_region(const KernelMapping& mapping,
+                             const struct stat& stat) {
+  int flags = mapping.flags();
+  int prot = mapping.prot();
+  const string& file_name = mapping.fsname();
   bool private_mapping = (flags & MAP_PRIVATE);
 
   // TODO: handle mmap'd files that are unlinked during
@@ -507,16 +485,17 @@ bool should_copy_mmap_region(const string& file_name, const struct stat* stat,
     LOG(debug) << "  copying file on tmpfs";
     return true;
   }
+  if (file_name == "/etc/ld.so.cache") {
+    // This file changes on almost every system update so we should copy it.
+    LOG(debug) << "  copying " << file_name;
+    return true;
+  }
   if (private_mapping && (prot & PROT_EXEC)) {
-    /* We currently don't record the images that we
-     * exec(). Since we're being optimistic there (*cough*
-     * *cough*), we're doing no worse (in theory) by being
-     * optimistic about the shared libraries too, most of
-     * which are system libraries. */
+    /* Be optimistic about private executable mappings */
     LOG(debug) << "  (no copy for +x private mapping " << file_name << ")";
     return false;
   }
-  if (private_mapping && (0111 & stat->st_mode)) {
+  if (private_mapping && (0111 & stat.st_mode)) {
     /* A private mapping of an executable file usually
      * indicates mapping data sections of object files.
      * Since we're already assuming those change very
@@ -532,7 +511,7 @@ bool should_copy_mmap_region(const string& file_name, const struct stat* stat,
   // set*[gu]id(), the real answer may be different.
   bool can_write_file = (0 == access(file_name.c_str(), W_OK));
 
-  if (!can_write_file && 0 == stat->st_uid) {
+  if (!can_write_file && 0 == stat.st_uid) {
     // We would like to assert this, but on Ubuntu 13.10,
     // the file /lib/i386-linux-gnu/libdl-2.17.so is
     // writeable by root for unknown reasons.
@@ -563,7 +542,7 @@ bool should_copy_mmap_region(const string& file_name, const struct stat* stat,
     LOG(debug) << "  copying private mapping of non-system -x " << file_name;
     return true;
   }
-  if (!(0222 & stat->st_mode)) {
+  if (!(0222 & stat.st_mode)) {
     /* We couldn't write the file because it's read only.
      * But it's not a root-owned file (therefore not a
      * system file), so it's likely that it could be
@@ -576,86 +555,15 @@ bool should_copy_mmap_region(const string& file_name, const struct stat* stat,
      * irregular ... */
     FATAL() << "Unhandled mmap " << file_name << "(prot:" << HEX(prot)
             << ((flags & MAP_SHARED) ? ";SHARED" : "")
-            << "); uid:" << stat->st_uid << " mode:" << stat->st_mode;
+            << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
   }
   return true;
 }
 
-ScopedFd create_shmem_segment(const string& name, size_t num_bytes) {
-  char path[PATH_MAX];
-  snprintf(path, sizeof(path) - 1, "%s/%s", SHMEM_FS, name.c_str());
-
-  ScopedFd fd = open(path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
-  if (0 > fd) {
-    FATAL() << "Failed to create shmem segment " << path;
-  }
-  /* Remove the fs name so that we don't have to worry about
-   * cleaning up this segment in error conditions. */
-  unlink(path);
-  resize_shmem_segment(fd, num_bytes);
-
-  LOG(debug) << "created shmem segment " << path;
-  return fd;
-}
-
-void resize_shmem_segment(ScopedFd& fd, size_t num_bytes) {
+void resize_shmem_segment(ScopedFd& fd, uint64_t num_bytes) {
   if (ftruncate(fd, num_bytes)) {
     FATAL() << "Failed to resize shmem to " << num_bytes;
   }
-}
-
-// TODO de-dup
-static void advance_syscall(Task* t) {
-  do {
-    t->cont_syscall();
-  } while (t->is_ptrace_seccomp_event() ||
-           ReplaySession::is_ignored_signal(t->pending_sig()));
-  assert(t->ptrace_event() == 0);
-}
-
-void destroy_buffers(Task* t) {
-  // NB: we have to pay all this complexity here because glibc
-  // makes its SYS_exit call through an inline int $0x80 insn,
-  // instead of going through the vdso.  There may be a deep
-  // reason for why it does that, but if it starts going through
-  // the vdso in the future, this code can be eliminated in
-  // favor of a *much* simpler vsyscall SYS_exit hook in the
-  // preload lib.
-  Registers exit_regs = t->regs();
-  ASSERT(t, is_exit_syscall(exit_regs.original_syscallno(), t->arch()))
-      << "Tracee should have been at exit, but instead at "
-      << t->syscall_name(exit_regs.original_syscallno());
-
-  // The tracee is at the entry to SYS_exit, but hasn't started
-  // the call yet.  We can't directly start injecting syscalls
-  // because the tracee is still in the kernel.  And obviously,
-  // if we finish the SYS_exit syscall, the tracee isn't around
-  // anymore.
-  //
-  // So hijack this SYS_exit call and rewrite it into a harmless
-  // one that we can exit successfully, SYS_gettid here (though
-  // that choice is arbitrary).
-  exit_regs.set_original_syscallno(syscall_number_for_gettid(t->arch()));
-  t->set_regs(exit_regs);
-  // This exits the hijacked SYS_gettid.  Now the tracee is
-  // ready to do our bidding.
-  advance_syscall(t);
-
-  // Restore these regs to what they would have been just before
-  // the tracee trapped at SYS_exit.  When we've finished
-  // cleanup, we'll restart the SYS_exit call.
-  exit_regs.set_original_syscallno(-1);
-  exit_regs.set_syscallno(syscall_number_for_exit(t->arch()));
-  exit_regs.set_ip(exit_regs.ip() - syscall_instruction_length(t->arch()));
-  ASSERT(t, is_at_syscall_instruction(t, exit_regs.ip()))
-      << "Tracee should have entered through int $0x80.";
-
-  // Do the actual buffer and fd cleanup.
-  t->destroy_buffers();
-
-  // Restart the SYS_exit call.
-  t->set_regs(exit_regs);
-  advance_syscall(t);
 }
 
 void cpuid(int code, int subrequest, unsigned int* a, unsigned int* c,
@@ -664,22 +572,6 @@ void cpuid(int code, int subrequest, unsigned int* a, unsigned int* c,
                : "=a"(*a), "=c"(*c), "=d"(*d)
                : "a"(code), "c"(subrequest)
                : "ebx");
-}
-
-void set_cpu_affinity(int cpu) {
-  assert(cpu >= 0);
-
-  cpu_set_t mask;
-  CPU_ZERO(&mask);
-  CPU_SET(cpu, &mask);
-  if (0 > sched_setaffinity(0, sizeof(mask), &mask)) {
-    FATAL() << "Couldn't bind to CPU " << cpu;
-  }
-}
-
-int get_num_cpus() {
-  int cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
-  return cpus > 0 ? cpus : 1;
 }
 
 template <typename Arch>
@@ -751,4 +643,49 @@ static TraceFrame::Time instruction_trace_at_event_last = 0;
 bool trace_instructions_up_to_event(TraceFrame::Time event) {
   return event > instruction_trace_at_event_start &&
          event <= instruction_trace_at_event_last;
+}
+
+void dump_task_set(const set<Task*>& tasks) {
+  printf("[");
+  for (auto& t : tasks) {
+    printf("%p (pid=%d, rec=%d),", t, t->tid, t->rec_tid);
+  }
+  printf("]\n");
+}
+
+void dump_task_map(const map<pid_t, Task*>& tasks) {
+  printf("[");
+  for (auto& t : tasks) {
+    printf("%p (pid=%d, rec=%d),", t.second, t.second->tid, t.second->rec_tid);
+  }
+  printf("]\n");
+}
+
+string real_path(const string& path) {
+  char buf[PATH_MAX];
+  if (realpath(path.c_str(), buf) == buf) {
+    return string(buf);
+  }
+  return path;
+}
+
+string exe_directory() {
+  string exe_path = real_path("/proc/self/exe");
+  int end = exe_path.length();
+  // Chop off the filename
+  while (end > 0 && exe_path[end - 1] != '/') {
+    --end;
+  }
+  exe_path.erase(end);
+  return exe_path;
+}
+
+/**
+ * Get the current time from the preferred monotonic clock in units of
+ * seconds, relative to an unspecific point in the past.
+ */
+double monotonic_now_sec(void) {
+  struct timespec tp;
+  clock_gettime(CLOCK_MONOTONIC, &tp);
+  return (double)tp.tv_sec + (double)tp.tv_nsec / 1e9;
 }

@@ -7,10 +7,12 @@
 
 #include "preload/preload_interface.h"
 
+#include "AddressSpace.h"
 #include "Command.h"
 #include "kernel_metadata.h"
 #include "main.h"
 #include "TraceStream.h"
+#include "util.h"
 
 using namespace std;
 
@@ -31,6 +33,7 @@ DumpCommand DumpCommand::singleton(
     "  like `1000-5000'.  By default, all events are dumped.\n"
     "  -b, --syscallbuf           dump syscallbuf contents\n"
     "  -m, --recorded-metadata    dump recorded data metadata\n"
+    "  -p, --mmaps                dump mmap data\n"
     "  -r, --raw                  dump trace frames in a more easily\n"
     "                             machine-parseable format instead of the\n"
     "                             default human-readable format\n"
@@ -39,12 +42,14 @@ DumpCommand DumpCommand::singleton(
 struct DumpFlags {
   bool dump_syscallbuf;
   bool dump_recorded_data_metadata;
+  bool dump_mmaps;
   bool raw_dump;
   bool dump_statistics;
 
   DumpFlags()
       : dump_syscallbuf(false),
         dump_recorded_data_metadata(false),
+        dump_mmaps(false),
         raw_dump(false),
         dump_statistics(false) {}
 };
@@ -57,6 +62,7 @@ static bool parse_dump_arg(std::vector<std::string>& args, DumpFlags& flags) {
   static const OptionSpec options[] = { { 'b', "syscallbuf", NO_PARAMETER },
                                         { 'm', "recorded-metadata",
                                           NO_PARAMETER },
+                                        { 'p', "mmaps", NO_PARAMETER },
                                         { 'r', "raw", NO_PARAMETER },
                                         { 's', "statistics", NO_PARAMETER } };
   ParsedOption opt;
@@ -70,6 +76,9 @@ static bool parse_dump_arg(std::vector<std::string>& args, DumpFlags& flags) {
       break;
     case 'm':
       flags.dump_recorded_data_metadata = true;
+      break;
+    case 'p':
+      flags.dump_mmaps = true;
       break;
     case 'r':
       flags.raw_dump = true;
@@ -101,9 +110,9 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
   auto end_ptr = record_ptr + bytes_remaining;
   while (record_ptr < end_ptr) {
     auto record = reinterpret_cast<const struct syscallbuf_record*>(record_ptr);
-    fprintf(out, "  { syscall:'%s', ret:0x%lx }\n",
+    fprintf(out, "  { syscall:'%s', ret:0x%lx, size:0x%lx }\n",
             syscall_name(record->syscallno, frame.event().arch()).c_str(),
-            (long)record->ret);
+            (long)record->ret, (long)record->size);
     if (record->size < sizeof(*record)) {
       fprintf(stderr, "Malformed trace file (bad record size)\n");
       abort();
@@ -152,6 +161,36 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
       if (flags.dump_syscallbuf) {
         dump_syscallbuf_data(trace, out, frame);
       }
+
+      while (true) {
+        TraceReader::MappedData data;
+        bool found;
+        KernelMapping km = trace.read_mapped_region(&data, &found);
+        if (!found) {
+          break;
+        }
+        if (flags.dump_mmaps) {
+          char prot_flags[] = "rwxp";
+          if (!(km.prot() & PROT_READ)) {
+            prot_flags[0] = '-';
+          }
+          if (!(km.prot() & PROT_WRITE)) {
+            prot_flags[1] = '-';
+          }
+          if (!(km.prot() & PROT_EXEC)) {
+            prot_flags[2] = '-';
+          }
+          if (km.flags() & MAP_SHARED) {
+            prot_flags[3] = 's';
+          }
+          fprintf(out, "  { map_file:\"%s\", addr:%p, length:%p, "
+                       "prot_flags:\"%s\", file_offset:0x%llx }\n",
+                  km.fsname().c_str(), (void*)km.start().as_int(),
+                  (void*)km.size(), prot_flags,
+                  (long long)km.file_offset_bytes());
+        }
+      }
+
       TraceReader::RawData data;
       while (process_raw_data && trace.read_raw_data_for_frame(frame, data)) {
         if (flags.dump_recorded_data_metadata) {
@@ -166,6 +205,13 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
       TraceReader::RawData data;
       while (process_raw_data && trace.read_raw_data_for_frame(frame, data)) {
       }
+      while (true) {
+        TraceReader::MappedData data;
+        KernelMapping km = trace.read_mapped_region(&data);
+        if (km.size() == 0) {
+          break;
+        }
+      }
     }
   }
 }
@@ -173,8 +219,8 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
 static void dump_statistics(const TraceReader& trace, FILE* out) {
   uint64_t uncompressed = trace.uncompressed_bytes();
   uint64_t compressed = trace.compressed_bytes();
-  fprintf(stdout, "// Uncompressed bytes %" PRIu64 ", compressed bytes %" PRIu64
-                  ", ratio %.2fx\n",
+  fprintf(out, "// Uncompressed bytes %" PRIu64 ", compressed bytes %" PRIu64
+               ", ratio %.2fx\n",
           uncompressed, compressed, double(uncompressed) / compressed);
 }
 

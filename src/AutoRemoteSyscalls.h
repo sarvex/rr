@@ -9,6 +9,7 @@
 
 #include "Registers.h"
 #include "ScopedFd.h"
+#include "task.h"
 
 class AutoRemoteSyscalls;
 class Task;
@@ -88,6 +89,8 @@ private:
  */
 class AutoRemoteSyscalls {
 public:
+  enum MemParamsEnabled { ENABLE_MEMORY_PARAMS, DISABLE_MEMORY_PARAMS };
+
   /**
    * Prepare |t| for a series of remote syscalls.
    *
@@ -95,7 +98,8 @@ public:
    * the caller *must* ensure the callee will not receive any
    * signals.  This code does not attempt to deal with signals.
    */
-  AutoRemoteSyscalls(Task* t);
+  AutoRemoteSyscalls(Task* t,
+                     MemParamsEnabled enable_mem_params = ENABLE_MEMORY_PARAMS);
   /**
    * Undo in |t| any preparations that were made for a series of
    * remote syscalls.
@@ -138,15 +142,36 @@ public:
     // The first syscall argument is called "arg 1", so
     // our syscall-arg-index template parameter starts
     // with "1".
-    return syscall_helper<1>(syscallno, callregs, args...);
+    syscall_helper<1>(syscallno, callregs, args...);
+    return t->regs().syscall_result_signed();
+  }
+
+  template <typename... Rest>
+  long infallible_syscall(int syscallno, Rest... args) {
+    Registers callregs = regs();
+    // The first syscall argument is called "arg 1", so
+    // our syscall-arg-index template parameter starts
+    // with "1".
+    syscall_helper<1>(syscallno, callregs, args...);
+    check_syscall_result(syscallno);
+    return t->regs().syscall_result_signed();
+  }
+
+  template <typename... Rest>
+  remote_ptr<void> infallible_syscall_ptr(int syscallno, Rest... args) {
+    Registers callregs = regs();
+    syscall_helper<1>(syscallno, callregs, args...);
+    check_syscall_result(syscallno);
+    return t->regs().syscall_result();
   }
 
   /**
    * Remote mmap syscalls are common and non-trivial due to the need to
    * select either mmap2 or mmap.
    */
-  remote_ptr<void> mmap_syscall(remote_ptr<void> addr, size_t length, int prot,
-                                int flags, int child_fd, uint64_t offset_pages);
+  remote_ptr<void> infallible_mmap_syscall(remote_ptr<void> addr, size_t length,
+                                           int prot, int flags, int child_fd,
+                                           uint64_t offset_pages);
 
   /** The Task in the context of which we're making syscalls. */
   Task* task() const { return t; }
@@ -174,11 +199,8 @@ public:
    * return value is undefined.  Call |wait_remote_syscall()| to
    * finish the syscall and get the return value.
    */
-  enum SyscallWaiting {
-    WAIT = 1,
-    DONT_WAIT = 0
-  };
-  long syscall_helper(SyscallWaiting wait, int syscallno, Registers& callregs);
+  enum SyscallWaiting { WAIT = 1, DONT_WAIT = 0 };
+  void syscall_helper(SyscallWaiting wait, int syscallno, Registers& callregs);
 
 private:
   /**
@@ -187,7 +209,9 @@ private:
    * |syscallno| is only for assertion checking. If no value is passed in,
    * everything should work without the assertion checking.
    */
-  long wait_syscall(int syscallno = -1);
+  void wait_syscall(int syscallno = -1);
+
+  void check_syscall_result(int syscallno);
 
   /**
    * "Recursively" build the set of syscall registers in
@@ -195,23 +219,23 @@ private:
    * |arg|, and |args| are the remaining arguments.
    */
   template <int Index, typename T, typename... Rest>
-  long syscall_helper(int syscallno, Registers& callregs, T arg, Rest... args) {
+  void syscall_helper(int syscallno, Registers& callregs, T arg, Rest... args) {
     callregs.set_arg<Index>(arg);
-    return syscall_helper<Index + 1>(syscallno, callregs, args...);
+    syscall_helper<Index + 1>(syscallno, callregs, args...);
   }
   /**
    * "Recursion" "base case": no more arguments to build, so
    * just make the syscall and return the kernel return value.
    */
-  template <int Index> long syscall_helper(int syscallno, Registers& callregs) {
-    return syscall_helper(WAIT, syscallno, callregs);
+  template <int Index> void syscall_helper(int syscallno, Registers& callregs) {
+    syscall_helper(WAIT, syscallno, callregs);
   }
 
   template <typename Arch> ScopedFd retrieve_fd_arch(int fd);
 
   Task* t;
   Registers initial_regs;
-  remote_ptr<uint8_t> initial_ip;
+  remote_code_ptr initial_ip;
   remote_ptr<void> initial_sp;
   int pending_syscallno;
 

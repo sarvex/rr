@@ -51,10 +51,9 @@ static void restore_sigsegv_state(Task* t) {
   AutoRemoteSyscalls remote(t);
   {
     AutoRestoreMem child_sa(remote, sa.data(), sa.size());
-    int ret = remote.syscall(syscall_number_for_rt_sigaction(remote.arch()),
-                             SIGSEGV, child_sa.get().as_int(), nullptr,
-                             sigaction_sigset_size(remote.arch()));
-    ASSERT(t, 0 == ret) << "Failed to restore SIGSEGV handler";
+    remote.infallible_syscall(syscall_number_for_rt_sigaction(remote.arch()),
+                              SIGSEGV, child_sa.get().as_int(), nullptr,
+                              sigaction_sigset_size(remote.arch()));
   }
   // NB: we would normally want to restore the SIG_BLOCK for
   // SIGSEGV here, but doing so doesn't change the kernel's
@@ -67,7 +66,9 @@ static void restore_sigsegv_state(Task* t) {
 static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
 static bool is_ip_rdtsc(Task* t) {
   uint8_t insn[sizeof(rdtsc_insn)];
-  if (sizeof(insn) != t->read_bytes_fallible(t->ip(), sizeof(insn), insn)) {
+  if (sizeof(insn) !=
+      t->read_bytes_fallible(t->ip().to_data_ptr<uint8_t>(), sizeof(insn),
+                             insn)) {
     return false;
   }
   return !memcmp(insn, rdtsc_insn, sizeof(insn));
@@ -78,10 +79,9 @@ static bool is_ip_rdtsc(Task* t) {
  * from a rdtsc and |t| was updated appropriately, false otherwise.
  */
 static bool try_handle_rdtsc(Task* t, siginfo_t* si) {
-  int sig = si->si_signo;
-  assert(sig != SIGTRAP);
+  ASSERT(t, si->si_signo == SIGSEGV);
 
-  if (sig != SIGSEGV || !is_ip_rdtsc(t)) {
+  if (!is_ip_rdtsc(t)) {
     return false;
   }
 
@@ -91,29 +91,80 @@ static bool try_handle_rdtsc(Task* t, siginfo_t* si) {
   r.set_ip(r.ip() + sizeof(rdtsc_insn));
   t->set_regs(r);
 
-  // When SIGSEGV is blocked, apparently the kernel has to do
-  // some ninjutsu to raise the RDTSC trap.  We see the SIGSEGV
-  // bit in the "SigBlk" mask in /proc/status cleared, and if
-  // there's a user handler the SIGSEGV bit in "SigCgt" is
-  // cleared too.  That's perfectly fine, except that it's
-  // unclear who's supposed to undo the signal-state munging.  A
-  // legitimate argument can be made that the tracer is
-  // responsible, so we go ahead and restore the old state.
-  //
-  // One could also argue that this is a kernel bug.  If so,
-  // then this is a workaround that can be removed in the
-  // future.
-  //
-  // If we don't restore the old state, at least firefox has
-  // been observed to hang at delivery of SIGSEGV.  However, the
-  // test written for this bug, fault_in_code_addr, doesn't hang
-  // without the restore.
-  if (t->is_sig_blocked(SIGSEGV)) {
-    restore_sigsegv_state(t);
-  }
-
   t->push_event(Event(EV_SEGV_RDTSC, HAS_EXEC_INFO, t->arch()));
   LOG(debug) << "  trapped for rdtsc: returning " << current_time;
+  return true;
+}
+
+/**
+ * Return true if |t| was stopped because of a SIGSEGV and we want to retry
+ * the instruction after emulating MAP_GROWSDOWN.
+ */
+static bool try_grow_map(Task* t, siginfo_t* si) {
+  ASSERT(t, si->si_signo == SIGSEGV);
+
+  // Use kernel_abi to avoid odd inconsistencies between distros
+  auto arch_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
+  auto addr = arch_si->_sifields._sigfault.si_addr_.rptr();
+
+  auto maps = t->vm()->maps_starting_at(floor_page_size(addr));
+  auto it = maps.begin();
+  if (it == maps.end()) {
+    LOG(debug) << "try_grow_map " << addr << ": no later map to grow downward";
+    return false;
+  }
+  if (addr >= it->map.start()) {
+    LOG(debug) << "try_grow_map " << addr << ": address already mapped";
+    return false;
+  }
+  if (!(it->map.flags() & MAP_GROWSDOWN)) {
+    LOG(debug) << "try_grow_map " << addr << ": map is not MAP_GROWSDOWN ("
+               << it->map << ")";
+    return false;
+  }
+
+  auto new_start = floor_page_size(addr);
+  static const uintptr_t grow_size = 0x10000;
+  if (it->map.start().as_int() >= grow_size) {
+    auto possible_new_start = std::min(new_start, it->map.start() - grow_size);
+    auto earlier_maps = t->vm()->maps_starting_at(possible_new_start);
+    if (earlier_maps.begin()->map.start() == it->map.start()) {
+      // No intervening map
+      new_start = possible_new_start;
+    }
+  }
+  LOG(debug) << "try_grow_map " << addr << ": trying to grow map " << it->map;
+
+  struct rlimit stack_limit;
+  int ret = prlimit(t->tid, RLIMIT_STACK, NULL, &stack_limit);
+  if (ret >= 0 && stack_limit.rlim_cur != RLIM_INFINITY) {
+    new_start = std::max(new_start,
+                         ceil_page_size(it->map.end() - stack_limit.rlim_cur));
+    if (new_start > addr) {
+      LOG(debug) << "try_grow_map " << addr << ": RLIMIT_STACK exceeded";
+      return false;
+    }
+  }
+
+  {
+    AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
+    remote.infallible_mmap_syscall(
+        new_start, it->map.start() - new_start, it->map.prot(),
+        (it->map.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS, -1, 0);
+  }
+
+  KernelMapping km =
+      t->vm()->map(new_start, it->map.start() - new_start, it->map.prot(),
+                   it->map.flags() | MAP_ANONYMOUS, 0, string(),
+                   KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
+  t->trace_writer().write_mapped_region(km, km.fake_stat());
+  // No need to flush syscallbuf here. It's safe to map these pages "early"
+  // before they're really needed.
+  t->record_event(Event(EV_GROW_MAP, NO_EXEC_INFO, t->arch()),
+                  Task::DONT_FLUSH_SYSCALLBUF);
+  t->push_event(Event::noop(t->arch()));
+  LOG(debug) << "try_grow_map " << addr << ": extended map "
+             << t->vm()->mapping_of(addr).map;
   return true;
 }
 
@@ -137,7 +188,7 @@ void arm_desched_event(Task* t) {
 static void handle_desched_event(Task* t, const siginfo_t* si) {
   ASSERT(t, (SYSCALLBUF_DESCHED_SIGNAL == si->si_signo &&
              si->si_code == POLL_IN && si->si_fd == t->desched_fd_child))
-      << "Tracee is using SIGSYS??? (code=" << si->si_code
+      << "Tracee is using SIGPWR??? (code=" << si->si_code
       << ", fd=" << si->si_fd << ")";
 
   /* If the tracee isn't in the critical section where a desched
@@ -146,8 +197,15 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
    *
    * It's OK if the tracee is in the critical section for a
    * may-block syscall B, but this signal was delivered by an
-   * event programmed by a previous may-block syscall A. */
-  if (!t->syscallbuf_hdr->desched_signal_may_be_relevant) {
+   * event programmed by a previous may-block syscall A.
+   *
+   * If we're running in a signal handler inside an interrupted syscallbuf
+   * system call, never do anything here. Syscall buffering is disabled and
+   * the desched_signal_may_be_relevant was set by the outermost syscallbuf
+   * invocation.
+   */
+  if (!t->syscallbuf_hdr->desched_signal_may_be_relevant ||
+      t->running_inside_desched()) {
     LOG(debug) << "  (not entering may-block syscall; resuming)";
     /* We have to disarm the event just in case the tracee
      * has cleared the relevancy flag, but not yet
@@ -226,7 +284,7 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
     // syscall may have re-armed the event.
     disarm_desched_event(t);
 
-    t->cont_syscall();
+    t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
     int sig = t->stop_sig();
 
     if (STOPSIG_SYSCALL == sig) {
@@ -285,17 +343,6 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
         next_record(t->syscallbuf_hdr);
     t->push_event(DeschedEvent(desched_rec, t->arch()));
     int call = t->desched_rec()->syscallno;
-    /* Replay needs to be prepared to see the ioctl() that arms
-     * the desched counter when it's trying to step to the entry
-     * of |call|.  We'll record the syscall entry when the main
-     * recorder code sees the tracee's syscall event. */
-    t->record_current_event();
-
-    /* Because we set the |delay_syscallbuf_reset| flag and the
-     * record counter will stay intact for a bit, we need to also
-     * prevent later events from flushing the syscallbuf until
-     * we've unblocked the reset. */
-    t->delay_syscallbuf_flush = true;
 
     /* The descheduled syscall was interrupted by a signal, like
      * all other may-restart syscalls, with the exception that
@@ -321,10 +368,6 @@ static void handle_desched_event(Task* t, const siginfo_t* si) {
 
   LOG(debug) << "  resuming (and probably switching out) blocked `"
              << t->syscall_name(call) << "'";
-}
-
-static void record_signal(Task* t, const siginfo_t& si) {
-  t->push_event(SignalEvent(si, is_deterministic_signal(si), t->arch()));
 }
 
 static bool is_safe_to_deliver_signal(Task* t) {
@@ -384,7 +427,27 @@ SignalHandled handle_signal(Task* t, siginfo_t* si) {
    * and fudge t appropriately. */
   switch (si->si_signo) {
     case SIGSEGV:
-      if (try_handle_rdtsc(t, si)) {
+      if (try_handle_rdtsc(t, si) || try_grow_map(t, si)) {
+        // When SIGSEGV is blocked, apparently the kernel has to do
+        // some ninjutsu to raise the trap.  We see the SIGSEGV
+        // bit in the "SigBlk" mask in /proc/status cleared, and if
+        // there's a user handler the SIGSEGV bit in "SigCgt" is
+        // cleared too.  That's perfectly fine, except that it's
+        // unclear who's supposed to undo the signal-state munging.  A
+        // legitimate argument can be made that the tracer is
+        // responsible, so we go ahead and restore the old state.
+        //
+        // One could also argue that this is a kernel bug.  If so,
+        // then this is a workaround that can be removed in the
+        // future.
+        //
+        // If we don't restore the old state, at least firefox has
+        // been observed to hang at delivery of SIGSEGV.  However, the
+        // test written for this bug, fault_in_code_addr, doesn't hang
+        // without the restore.
+        if (t->is_sig_blocked(SIGSEGV)) {
+          restore_sigsegv_state(t);
+        }
         return SIGNAL_HANDLED;
       }
       break;
@@ -399,12 +462,18 @@ SignalHandled handle_signal(Task* t, siginfo_t* si) {
 
   if (t->emulate_ptrace_stop((si->si_signo << 8) | 0x7f,
                              SIGNAL_DELIVERY_STOP)) {
+    t->save_ptrace_signal_siginfo(*si);
+    // Record a SCHED event so that replay progresses the tracee to the
+    // current point before we notify the tracer.
+    t->push_event(Event(EV_SCHED, HAS_EXEC_INFO, t->arch()));
+    t->record_current_event();
+    t->pop_event(EV_SCHED);
     // ptracer has been notified, so don't deliver the signal now.
     // The signal won't be delivered for real until the ptracer calls
     // PTRACE_CONT with the signal number (which we don't support yet!).
     return SIGNAL_PTRACE_STOP;
   }
 
-  record_signal(t, *si);
+  t->push_event(SignalEvent(*si, t->arch()));
   return SIGNAL_HANDLED;
 }

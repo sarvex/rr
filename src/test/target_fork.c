@@ -12,7 +12,7 @@ static void good_breakpoint(void) {
   (void)break_here;
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char* argv[]) {
   int num_syscalls;
   int child;
   int i;
@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
 
   atomic_printf("%d: running %d syscalls ...\n", getpid(), num_syscalls);
   for (i = 0; i < num_syscalls; ++i) {
-    sys_gettid();
+    geteuid();
   }
 
   if (0 == (child = fork())) {

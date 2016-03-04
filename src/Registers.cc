@@ -55,8 +55,7 @@ struct RegisterValue {
     return static_cast<const char*>(regs) + offset;
   }
 
-private:
-  uint64_t mask_for_nbytes(size_t nbytes) {
+  static uint64_t mask_for_nbytes(size_t nbytes) {
     assert(nbytes <= sizeof(comparison_mask));
     return ((nbytes == sizeof(comparison_mask)) ? uint64_t(0)
                                                 : (uint64_t(1) << nbytes * 8)) -
@@ -83,6 +82,7 @@ template <> struct RegisterInfo<rr::X86Arch> {
   static const size_t num_registers = DREG_NUM_LINUX_I386;
   typedef RegisterTable<num_registers> Table;
   static Table registers;
+  static RegisterValue non_gdb_registers[0];
 };
 
 template <> struct RegisterInfo<rr::X64Arch> {
@@ -92,13 +92,14 @@ template <> struct RegisterInfo<rr::X64Arch> {
   static const size_t num_registers = DREG_NUM_LINUX_X86_64;
   typedef RegisterTable<num_registers> Table;
   static Table registers;
+  static RegisterValue non_gdb_registers[2];
 };
 
 #define RV_ARCH(gdb_suffix, name, arch, extra_ctor_args)                       \
   RegisterInit(DREG_##gdb_suffix,                                              \
                RegisterValue(#name, offsetof(arch::user_regs_struct, name),    \
-                             sizeof(((arch::user_regs_struct*)0)               \
-                                        ->name) extra_ctor_args))
+                             sizeof(((arch::user_regs_struct*)0)->name)        \
+                                 extra_ctor_args))
 #define RV_X86(gdb_suffix, name)                                               \
   RV_ARCH(gdb_suffix, name, rr::X86Arch, /* empty */)
 #define RV_X64(gdb_suffix, name)                                               \
@@ -109,73 +110,68 @@ template <> struct RegisterInfo<rr::X64Arch> {
 #define RV_X64_WITH_MASK(gdb_suffix, name, comparison_mask)                    \
   RV_ARCH(gdb_suffix, name, rr::X64Arch, COMMA comparison_mask)
 
-/* The following are eflags that have been observed to be non-deterministic
-   in practice.  We need to mask them off when comparing registers to
-   prevent replay from diverging.  */
-enum {
-  /* The linux kernel has been observed to report this as zero in some
-     states during system calls.  It always seems to be 1 during user-space
-     execution so we should be able to ignore it.  */
-  RESERVED_FLAG_1 = 1 << 1,
-  /* According to http://www.logix.cz/michal/doc/i386/chp04-01.htm:
-        The RF flag temporarily disables debug exceptions so that an
-       instruction can be restarted after a debug exception without
-       immediately causing another debug exception.  Refer to Chapter 12
-       for details.
-      Chapter 12 isn't particularly clear on the point, but the flag appears
-     to be set by |int3| exceptions.
-      This divergence has been observed when continuing a tracee to an
-     execution target by setting an |int3| breakpoint, which isn't used
-     during recording.  No single-stepping was used during the recording
-     either.  */
-  RESUME_FLAG = 1 << 16,
-  /* It is no longer known why this bit is ignored.  */
-  CPUID_ENABLED_FLAG = 1 << 21,
-};
-const uint64_t deterministic_eflags_mask =
-    ~uint32_t(RESERVED_FLAG_1 | RESUME_FLAG | CPUID_ENABLED_FLAG);
+const uint64_t deterministic_eflags_mask = ~uint32_t(
+    /* The following are eflags that have been observed to be non-deterministic
+       in practice.  We need to mask them off when comparing registers to
+       prevent replay from diverging.  */
+    /* The linux kernel has been observed to report this as zero in some
+       states during system calls.  It always seems to be 1 during user-space
+       execution so we should be able to ignore it.  */
+    X86_RESERVED_FLAG |
+    /* This is usually set but we have observed cases where it's clear. It
+     * shouldn't be modifiable by user space so we don't know why it would
+     * change.
+     */
+    X86_IF_FLAG |
+    /* According to http://www.logix.cz/michal/doc/i386/chp04-01.htm:
+          The RF flag temporarily disables debug exceptions so that an
+         instruction can be restarted after a debug exception without
+         immediately causing another debug exception.  Refer to Chapter 12
+         for details.
+        Chapter 12 isn't particularly clear on the point, but the flag appears
+       to be set by |int3| exceptions.
+        This divergence has been observed when continuing a tracee to an
+       execution target by setting an |int3| breakpoint, which isn't used
+       during recording.  No single-stepping was used during the recording
+       either.  */
+    X86_RF_FLAG |
+    /* It is no longer known why this bit is ignored.  */
+    X86_ID_FLAG);
 
 RegisterInfo<rr::X86Arch>::Table RegisterInfo<rr::X86Arch>::registers = {
-  RV_X86(EAX, eax),
-  RV_X86(ECX, ecx),
-  RV_X86(EDX, edx),
-  RV_X86(EBX, ebx),
-  RV_X86(ESP, esp),
-  RV_X86(EBP, ebp),
-  RV_X86(ESI, esi),
-  RV_X86(EDI, edi),
-  RV_X86(EIP, eip),
-  RV_X86_WITH_MASK(EFLAGS, eflags, deterministic_eflags_mask),
-  RV_X86_WITH_MASK(CS, xcs, 0),
-  RV_X86_WITH_MASK(SS, xss, 0),
-  RV_X86_WITH_MASK(DS, xds, 0),
-  RV_X86_WITH_MASK(ES, xes, 0),
-  RV_X86(FS, xfs),
+  RV_X86(EAX, eax), RV_X86(ECX, ecx), RV_X86(EDX, edx), RV_X86(EBX, ebx),
+  RV_X86(ESP, esp), RV_X86(EBP, ebp), RV_X86(ESI, esi), RV_X86(EDI, edi),
+  RV_X86(EIP, eip), RV_X86_WITH_MASK(EFLAGS, eflags, deterministic_eflags_mask),
+  RV_X86_WITH_MASK(CS, xcs, 0), RV_X86_WITH_MASK(SS, xss, 0),
+  RV_X86_WITH_MASK(DS, xds, 0), RV_X86_WITH_MASK(ES, xes, 0), RV_X86(FS, xfs),
   RV_X86(GS, xgs),
   // The comparison for this is handled specially elsewhere.
   RV_X86_WITH_MASK(ORIG_EAX, orig_eax, 0),
 };
 
-RegisterInfo<rr::X64Arch>::Table RegisterInfo<
-    rr::X64Arch>::registers = { RV_X64(RAX, rax), RV_X64(RCX, rcx),
-                                RV_X64(RDX, rdx), RV_X64(RBX, rbx),
-                                RV_X64_WITH_MASK(RSP, rsp, 0), RV_X64(RBP, rbp),
-                                RV_X64(RSI, rsi), RV_X64(RDI, rdi),
-                                RV_X64(R8, r8), RV_X64(R9, r9),
-                                RV_X64(R10, r10), RV_X64(R11, r11),
-                                RV_X64(R12, r12), RV_X64(R13, r13),
-                                RV_X64(R14, r14), RV_X64(R15, r15),
-                                RV_X64(RIP, rip),
-                                RV_X64_WITH_MASK(64_EFLAGS, eflags,
-                                                 deterministic_eflags_mask),
-                                RV_X64_WITH_MASK(64_CS, cs, 0),
-                                RV_X64_WITH_MASK(64_SS, ss, 0),
-                                RV_X64_WITH_MASK(64_DS, ds, 0),
-                                RV_X64_WITH_MASK(64_ES, es, 0),
-                                RV_X64(64_FS, fs), RV_X64(64_GS, gs),
-                                // The comparison for this is handled specially
-                                // elsewhere.
-                                RV_X64_WITH_MASK(ORIG_RAX, orig_rax, 0), };
+RegisterValue RegisterInfo<rr::X86Arch>::non_gdb_registers[0] = {};
+
+RegisterInfo<rr::X64Arch>::Table RegisterInfo<rr::X64Arch>::registers = {
+  RV_X64(RAX, rax), RV_X64(RCX, rcx), RV_X64(RDX, rdx), RV_X64(RBX, rbx),
+  RV_X64_WITH_MASK(RSP, rsp, 0), RV_X64(RBP, rbp), RV_X64(RSI, rsi),
+  RV_X64(RDI, rdi), RV_X64(R8, r8), RV_X64(R9, r9), RV_X64(R10, r10),
+  RV_X64(R11, r11), RV_X64(R12, r12), RV_X64(R13, r13), RV_X64(R14, r14),
+  RV_X64(R15, r15), RV_X64(RIP, rip),
+  RV_X64_WITH_MASK(64_EFLAGS, eflags, deterministic_eflags_mask),
+  RV_X64_WITH_MASK(64_CS, cs, 0), RV_X64_WITH_MASK(64_SS, ss, 0),
+  RV_X64_WITH_MASK(64_DS, ds, 0), RV_X64_WITH_MASK(64_ES, es, 0),
+  RV_X64(64_FS, fs), RV_X64(64_GS, gs),
+  // The comparison for this is handled specially
+  // elsewhere.
+  RV_X64_WITH_MASK(ORIG_RAX, orig_rax, 0),
+};
+
+RegisterValue RegisterInfo<rr::X64Arch>::non_gdb_registers[2] = {
+  { "fs_base", offsetof(rr::X64Arch::user_regs_struct, fs_base), 8,
+    RegisterValue::mask_for_nbytes(8) },
+  { "gs_base", offsetof(rr::X64Arch::user_regs_struct, gs_base), 8,
+    RegisterValue::mask_for_nbytes(8) }
+};
 
 #undef RV_X64
 #undef RV_X86
@@ -264,7 +260,22 @@ void Registers::print_register_file_for_trace_arch(
         assert(0 && "bad register size");
     }
   }
-  fprintf(f, "\n");
+
+  for (auto& rv : RegisterInfo<Arch>::non_gdb_registers) {
+    fprintf(f, " ");
+    const char* name = (style == Annotated ? rv.name : nullptr);
+
+    switch (rv.nbytes) {
+      case 8:
+        print_single_register<8>(f, name, rv.pointer_into(user_regs), formats);
+        break;
+      case 4:
+        print_single_register<4>(f, name, rv.pointer_into(user_regs), formats);
+        break;
+      default:
+        assert(0 && "bad register size");
+    }
+  }
 }
 
 void Registers::print_register_file_compact(FILE* f) const {
@@ -318,10 +329,8 @@ bool Registers::compare_registers_core(const char* name1, const Registers& reg1,
     uint64_t val1 = 0, val2 = 0;
     memcpy(&val1, rv.pointer_into(&reg1.u), rv.nbytes);
     memcpy(&val2, rv.pointer_into(&reg2.u), rv.nbytes);
-    val1 &= rv.comparison_mask;
-    val2 &= rv.comparison_mask;
 
-    if (val1 != val2) {
+    if ((val1 ^ val2) & rv.comparison_mask) {
       maybe_print_reg_mismatch(mismatch_behavior, rv.name, name1, val1, name2,
                                val2);
       match = false;
@@ -380,7 +389,8 @@ template <>
                                                    mismatch_behavior);
   // XXX haven't actually observed this to be true on x86-64 yet, but
   // assuming that it follows the x86 behavior.
-  if (reg1.u.x64regs.orig_rax >= 0 || reg2.u.x64regs.orig_rax >= 0) {
+  if ((intptr_t)reg1.u.x64regs.orig_rax >= 0 ||
+      (intptr_t)reg2.u.x64regs.orig_rax >= 0) {
     X64_REGCMP(orig_rax);
   }
   // Check the _upper bits of various registers we defined more conveniently
@@ -410,9 +420,9 @@ template <>
   bool match = compare_register_files_internal(name1, reg1, name2, reg2,
                                                mismatch_behavior);
 
-  ASSERT(t, !bail_error || match) << "Fatal register mismatch (ticks/rec:"
-                                  << t->tick_count() << "/"
-                                  << t->current_trace_frame().ticks() << ")";
+  ASSERT(t, !bail_error || match)
+      << "Fatal register mismatch (ticks/rec:" << t->tick_count() << "/"
+      << t->current_trace_frame().ticks() << ")";
 
   if (match && mismatch_behavior == LOG_MISMATCHES) {
     LOG(info) << "(register files are the same for " << name1 << " and "
@@ -496,12 +506,25 @@ size_t Registers::total_registers() const {
   RR_ARCH_FUNCTION(total_registers_arch, arch());
 }
 
+// In theory it doesn't matter how 32-bit register values are sign extended
+// to 64 bits for PTRACE_SETREGS. However:
+// -- When setting up a signal handler frame, the kernel does some arithmetic
+// on the 64-bit SP value and validates that the result points to writeable
+// memory. This validation fails if SP has been sign-extended to point
+// outside the 32-bit address space.
+// -- Some kernels (e.g. 4.3.3-301.fc23.x86_64) with commmit
+// c5c46f59e4e7c1ab244b8d38f2b61d317df90bba have a bug where if you clear
+// the upper 32 bits of %rax while in the kernel, syscalls may fail to
+// restart. So sign-extension is necessary for %eax in this case. We may as
+// well sign-extend %eax in all cases.
+
 typedef void (*NarrowConversion)(int32_t& r32, uint64_t& r64);
 typedef void (*SameConversion)(int32_t& r32, uint32_t& r64);
-template <NarrowConversion narrow, SameConversion same>
+template <NarrowConversion narrow, NarrowConversion narrow_signed,
+          SameConversion same>
 void convert_x86(X86Arch::user_regs_struct& x86,
                  X64Arch::user_regs_struct& x64) {
-  narrow(x86.eax, x64.rax);
+  narrow_signed(x86.eax, x64.rax);
   narrow(x86.ebx, x64.rbx);
   narrow(x86.ecx, x64.rcx);
   narrow(x86.edx, x64.rdx);
@@ -522,15 +545,8 @@ void convert_x86(X86Arch::user_regs_struct& x86,
 
 void to_x86_narrow(int32_t& r32, uint64_t& r64) { r32 = r64; }
 void to_x86_same(int32_t& r32, uint32_t& r64) { r32 = r64; }
-void from_x86_narrow(int32_t& r32, uint64_t& r64) {
-  // We must zero-extend 32-bit register values to 64-bit values when we
-  // do a PTRACE_SETREGS. Most of the time the upper 32 bits are irrelevant for
-  // a 32-bit tracee, but when setting up a signal handler frame, the kernel
-  // does some arithmetic on the 64-bit SP value and validates that the
-  // result points to writeable memory. This validation fails if SP has been
-  // sign-extended to point outside the 32-bit address space.
-  r64 = (uint32_t)r32;
-}
+void from_x86_narrow(int32_t& r32, uint64_t& r64) { r64 = (uint32_t)r32; }
+void from_x86_narrow_signed(int32_t& r32, uint64_t& r64) { r64 = (int64_t)r32; }
 void from_x86_same(int32_t& r32, uint32_t& r64) { r64 = r32; }
 
 void Registers::set_from_ptrace(const struct user_regs_struct& ptrace_regs) {
@@ -540,9 +556,9 @@ void Registers::set_from_ptrace(const struct user_regs_struct& ptrace_regs) {
   }
 
   assert(arch() == x86 && NativeArch::arch() == x86_64);
-  convert_x86<to_x86_narrow, to_x86_same>(
+  convert_x86<to_x86_narrow, to_x86_narrow, to_x86_same>(
       u.x86regs, *reinterpret_cast<X64Arch::user_regs_struct*>(
-                      const_cast<struct user_regs_struct*>(&ptrace_regs)));
+                     const_cast<struct user_regs_struct*>(&ptrace_regs)));
 }
 
 /**
@@ -552,18 +568,20 @@ void Registers::set_from_ptrace(const struct user_regs_struct& ptrace_regs) {
  * the 32-bit register values from u.x86regs into it.
  */
 struct user_regs_struct Registers::get_ptrace() const {
-  struct user_regs_struct result;
+  union {
+    struct user_regs_struct linux_api;
+    struct X64Arch::user_regs_struct x64arch_api;
+  } result;
   if (arch() == NativeArch::arch()) {
     memcpy(&result, &u, sizeof(result));
-    return result;
+    return result.linux_api;
   }
 
   assert(arch() == x86 && NativeArch::arch() == x86_64);
   memset(&result, 0, sizeof(result));
-  convert_x86<from_x86_narrow, from_x86_same>(
-      const_cast<Registers*>(this)->u.x86regs,
-      *reinterpret_cast<X64Arch::user_regs_struct*>(&result));
-  return result;
+  convert_x86<from_x86_narrow, from_x86_narrow_signed, from_x86_same>(
+      const_cast<Registers*>(this)->u.x86regs, result.x64arch_api);
+  return result.linux_api;
 }
 
 vector<uint8_t> Registers::get_ptrace_for_arch(SupportedArch arch) const {
@@ -587,23 +605,30 @@ vector<uint8_t> Registers::get_ptrace_for_arch(SupportedArch arch) const {
   return result;
 }
 
-bool Registers::clear_singlestep_flag() {
+uintptr_t Registers::flags() const {
   switch (arch()) {
     case x86:
-      if (u.x86regs.eflags & X86_TF_FLAG) {
-        u.x86regs.eflags &= ~X86_TF_FLAG;
-        return true;
-      }
-      return false;
+      return u.x86regs.eflags;
     case x86_64:
-      if (u.x64regs.eflags & X86_TF_FLAG) {
-        u.x64regs.eflags &= ~X86_TF_FLAG;
-        return true;
-      }
-      return false;
+      return u.x64regs.eflags | (uint64_t(u.x64regs.eflags_upper) << 32);
     default:
       assert(0 && "Unknown arch");
       return false;
+  }
+}
+
+void Registers::set_flags(uintptr_t value) {
+  switch (arch()) {
+    case x86:
+      u.x86regs.eflags = value;
+      break;
+    case x86_64:
+      u.x64regs.eflags = value;
+      u.x64regs.eflags_upper = uint64_t(value) >> 32;
+      break;
+    default:
+      assert(0 && "Unknown arch");
+      break;
   }
 }
 

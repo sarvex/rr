@@ -40,17 +40,22 @@ ReplayCommand ReplayCommand::singleton(
     "                             reached.\n"
     "  -g, --goto=<EVENT-NUM>     start a debug server on reaching "
     "<EVENT-NUM>\n"
-    "                             in the trace.  See -m above.\n"
+    "                             in the trace.  See -M in the general "
+    "options.\n"
     "  -p, --onprocess=<PID>|<COMMAND>\n"
     "                             start a debug server when <PID> or "
     "<COMMAND>\n"
     "                             has been exec()d, AND the target event has "
     "been\n"
     "                             reached.\n"
+    "  -d, --debugger=<FILE>      use <FILE> as the gdb command\n"
     "  -q, --no-redirect-output   don't replay writes to stdout/stderr\n"
     "  -s, --dbgport=<PORT>       only start a debug server on <PORT>;\n"
     "                             don't automatically launch the debugger\n"
     "                             client too.\n"
+    "  -t, --trace=<EVENT>        singlestep instructions and dump register\n"
+    "                             states when replaying towards <EVENT> or\n"
+    "                             later\n"
     "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n");
 
 struct ReplayFlags {
@@ -58,6 +63,8 @@ struct ReplayFlags {
   // event at which reached this event AND target_process has
   // been "created".
   TraceFrame::Time goto_event;
+
+  TraceFrame::Time singlestep_to_event;
 
   pid_t target_process;
 
@@ -70,11 +77,7 @@ struct ReplayFlags {
   // created at exec() (after the fork).
   //
   // We force choosers to specify which they mean.
-  enum {
-    CREATED_NONE,
-    CREATED_EXEC,
-    CREATED_FORK
-  } process_created_how;
+  enum { CREATED_NONE, CREATED_EXEC, CREATED_FORK } process_created_how;
 
   // Only open a debug socket, don't launch the debugger too.
   bool dont_launch_debugger;
@@ -85,15 +88,20 @@ struct ReplayFlags {
   // Pass this file name to debugger with -x
   string gdb_command_file_path;
 
+  // Specify a custom gdb binary with -d
+  string gdb_binary_file_path;
+
   /* When true, echo tracee stdout/stderr writes to console. */
   bool redirect;
 
   ReplayFlags()
       : goto_event(0),
+        singlestep_to_event(0),
         target_process(0),
         process_created_how(CREATED_NONE),
         dont_launch_debugger(false),
         dbg_port(-1),
+        gdb_binary_file_path("gdb"),
         redirect(true) {}
 };
 
@@ -103,14 +111,17 @@ static bool parse_replay_arg(std::vector<std::string>& args,
     return true;
   }
 
-  static const OptionSpec options[] = { { 'a', "autopilot", NO_PARAMETER },
-                                        { 's', "dbgport", HAS_PARAMETER },
-                                        { 'g', "goto", HAS_PARAMETER },
-                                        { 'q', "no-redirect-output",
-                                          NO_PARAMETER },
-                                        { 'f', "onfork", HAS_PARAMETER },
-                                        { 'p', "onprocess", HAS_PARAMETER },
-                                        { 'x', "gdb-x", HAS_PARAMETER } };
+  static const OptionSpec options[] = {
+    { 'a', "autopilot", NO_PARAMETER },
+    { 'd', "debugger", HAS_PARAMETER },
+    { 's', "dbgport", HAS_PARAMETER },
+    { 'g', "goto", HAS_PARAMETER },
+    { 't', "trace", HAS_PARAMETER },
+    { 'q', "no-redirect-output", NO_PARAMETER },
+    { 'f', "onfork", HAS_PARAMETER },
+    { 'p', "onprocess", HAS_PARAMETER },
+    { 'x', "gdb-x", HAS_PARAMETER }
+  };
   ParsedOption opt;
   if (!Command::parse_option(args, options, &opt)) {
     return false;
@@ -120,6 +131,9 @@ static bool parse_replay_arg(std::vector<std::string>& args,
     case 'a':
       flags.goto_event = numeric_limits<decltype(flags.goto_event)>::max();
       flags.dont_launch_debugger = true;
+      break;
+    case 'd':
+      flags.gdb_binary_file_path = opt.value;
       break;
     case 'f':
       if (!opt.verify_valid_int(1, INT32_MAX)) {
@@ -155,6 +169,12 @@ static bool parse_replay_arg(std::vector<std::string>& args,
       flags.dbg_port = opt.int_value;
       flags.dont_launch_debugger = true;
       break;
+    case 't':
+      if (!opt.verify_valid_int(1, INT32_MAX)) {
+        return false;
+      }
+      flags.singlestep_to_event = opt.int_value;
+      break;
     case 'x':
       flags.gdb_command_file_path = opt.value;
       break;
@@ -186,23 +206,35 @@ static int find_pid_for_command(const string& trace_dir,
   return -1;
 }
 
+static bool pid_exists(const string& trace_dir, pid_t pid) {
+  TraceReader trace(trace_dir);
+
+  while (trace.good()) {
+    auto e = trace.read_task_event();
+    if (e.tid() == pid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool pid_execs(const string& trace_dir, pid_t pid) {
+  TraceReader trace(trace_dir);
+
+  while (trace.good()) {
+    auto e = trace.read_task_event();
+    if (e.tid() == pid && e.type() == TraceTaskEvent::EXEC) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // The parent process waits until the server, |waiting_for_child|, creates a
 // debug socket. Then the parent exec()s the debugger over itself. While it's
 // waiting for the child, this is the child's pid.
 // This needs to be global because it's used by a signal handler.
 static pid_t waiting_for_child;
-
-/**
- * Set the blocked-ness of |sig| to |blockedness|.
- */
-static void set_sig_blockedness(int sig, int blockedness) {
-  sigset_t sset;
-  sigemptyset(&sset);
-  sigaddset(&sset, sig);
-  if (sigprocmask(blockedness, &sset, nullptr)) {
-    FATAL() << "Didn't change sigmask.";
-  }
-}
 
 static ReplaySession::Flags session_flags(ReplayFlags flags) {
   ReplaySession::Flags result;
@@ -224,7 +256,21 @@ static void serve_replay_no_debugger(const string& trace_dir,
   gettimeofday(&last_dump_time, NULL);
 
   while (true) {
-    auto result = replay_session->replay_step(RUN_CONTINUE);
+    RunCommand cmd = RUN_CONTINUE;
+    if (flags.singlestep_to_event > 0 &&
+        replay_session->trace_reader().time() >= flags.singlestep_to_event) {
+      cmd = RUN_SINGLESTEP;
+      fputs("Stepping from:", stderr);
+      Task* t = replay_session->current_task();
+      t->regs().print_register_file_compact(stderr);
+      fprintf(stderr, " ticks:%" PRId64 "\n", t->tick_count());
+    }
+
+    TraceFrame::Time before_time = replay_session->trace_reader().time();
+    auto result = replay_session->replay_step(cmd);
+    TraceFrame::Time after_time = replay_session->trace_reader().time();
+    assert(after_time >= before_time && after_time <= before_time + 1);
+
     ++step_count;
     if (DUMP_STATS_PERIOD > 0 && step_count % DUMP_STATS_PERIOD == 0) {
       struct timeval now;
@@ -247,25 +293,36 @@ static void serve_replay_no_debugger(const string& trace_dir,
     assert(result.status == REPLAY_CONTINUE);
     assert(result.break_status.watchpoints_hit.empty());
     assert(!result.break_status.breakpoint_hit);
-    assert(!result.break_status.singlestep_complete);
+    assert(cmd == RUN_SINGLESTEP || !result.break_status.singlestep_complete);
   }
 
   LOG(info) << ("Replayer successfully finished.");
 }
 
-static void handle_signal(int sig) {
-  switch (sig) {
-    case SIGINT:
-      // Translate the SIGINT into SIGTERM for the debugger
-      // server, because it's blocking SIGINT.  We don't use
-      // SIGINT for anything, so all it's meant to do is
-      // kill us, and SIGTERM works just as well for that.
-      if (waiting_for_child > 0) {
-        kill(waiting_for_child, SIGTERM);
-      }
-      break;
-    default:
-      FATAL() << "Unhandled signal " << signal_name(sig);
+/* Handling ctrl-C during replay:
+ * We want the entire group of processes to remain a single process group
+ * since that allows shell job control to work best.
+ * We want ctrl-C to not reach tracees, because that would disturb replay.
+ * That's taken care of by Task::set_up_process.
+ * We allow terminal SIGINT to go directly to the parent and the child (rr).
+ * rr's SIGINT handler |handle_SIGINT_in_child| just interrupts the replay
+ * if we're in the process of replaying to a target event, otherwise it
+ * does nothing.
+ * Before the parent execs gdb, its SIGINT handler does nothing. After exec,
+ * the signal handler is reset to default so gdb behaves as normal (which is
+ * why we use a signal handler instead of SIG_IGN).
+ */
+static void handle_SIGINT_in_parent(int sig) {
+  assert(sig == SIGINT);
+  // Just ignore it.
+}
+
+static GdbServer* server_ptr = nullptr;
+
+static void handle_SIGINT_in_child(int sig) {
+  assert(sig == SIGINT);
+  if (server_ptr) {
+    server_ptr->interrupt_replay_to_target();
   }
 }
 
@@ -295,16 +352,9 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
       auto session = ReplaySession::create(trace_dir);
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
-      GdbServer::serve(session, target, conn_flags, session_flags(flags));
+      GdbServer(session, session_flags(flags), target).serve_replay(conn_flags);
     }
     return 0;
-  }
-
-  struct sigaction sa;
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = handle_signal;
-  if (sigaction(SIGINT, &sa, nullptr)) {
-    FATAL() << "Couldn't set sigaction for SIGINT.";
   }
 
   int debugger_params_pipe[2];
@@ -315,17 +365,24 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
     // Ensure only the parent has the read end of the pipe open. Then if
     // the parent dies, our writes to the pipe will error out.
     close(debugger_params_pipe[0]);
+
     ScopedFd debugger_params_write_pipe(debugger_params_pipe[1]);
-    // The parent process (gdb) must be able to receive
-    // SIGINT's to interrupt non-stopped tracees.  But the
-    // debugger server isn't set up to handle SIGINT.  So
-    // block it.
-    set_sig_blockedness(SIGINT, SIG_BLOCK);
     auto session = ReplaySession::create(trace_dir);
     GdbServer::ConnectionFlags conn_flags;
     conn_flags.dbg_port = flags.dbg_port;
     conn_flags.debugger_params_write_pipe = &debugger_params_write_pipe;
-    GdbServer::serve(session, target, conn_flags, session_flags(flags));
+    GdbServer server(session, session_flags(flags), target);
+
+    server_ptr = &server;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_flags = SA_RESTART;
+    sa.sa_handler = handle_SIGINT_in_child;
+    if (sigaction(SIGINT, &sa, nullptr)) {
+      FATAL() << "Couldn't set sigaction for SIGINT.";
+    }
+
+    server.serve_replay(conn_flags);
     return 0;
   }
   // Ensure only the child has the write end of the pipe open. Then if
@@ -333,9 +390,18 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
   close(debugger_params_pipe[1]);
   LOG(debug) << getpid() << ": forked debugger server " << waiting_for_child;
 
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_flags = SA_RESTART;
+  sa.sa_handler = handle_SIGINT_in_parent;
+  if (sigaction(SIGINT, &sa, nullptr)) {
+    FATAL() << "Couldn't set sigaction for SIGINT.";
+  }
+
   {
     ScopedFd params_pipe_read_fd(debugger_params_pipe[0]);
-    GdbServer::launch_gdb(params_pipe_read_fd, flags.gdb_command_file_path);
+    GdbServer::launch_gdb(params_pipe_read_fd, flags.gdb_command_file_path,
+                          flags.gdb_binary_file_path);
   }
 
   // Child must have died before we were able to get debugger parameters
@@ -362,6 +428,11 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
 }
 
 int ReplayCommand::run(std::vector<std::string>& args) {
+  if (getenv("RUNNING_UNDER_RR")) {
+    fprintf(stderr, "rr: cannot run rr replay under rr. Exiting.\n");
+    return 1;
+  }
+
   bool found_dir = false;
   string trace_dir;
   ReplayFlags flags;
@@ -384,6 +455,20 @@ int ReplayCommand::run(std::vector<std::string>& args) {
     if (flags.target_process <= 0) {
       fprintf(stderr, "No process '%s' found. Try 'rr ps'.\n",
               flags.target_command.c_str());
+      return 2;
+    }
+  }
+  if (flags.process_created_how != ReplayFlags::CREATED_NONE) {
+    if (!pid_exists(trace_dir, flags.target_process)) {
+      fprintf(stderr, "No process %d found in trace. Try 'rr ps'.\n",
+              flags.target_process);
+      return 2;
+    }
+    if (flags.process_created_how == ReplayFlags::CREATED_EXEC &&
+        !pid_execs(trace_dir, flags.target_process)) {
+      fprintf(stderr, "Process %d never exec()ed. Try 'rr ps', or use "
+                      "'-f'.\n",
+              flags.target_process);
       return 2;
     }
   }

@@ -4,10 +4,13 @@
 
 #include "task.h"
 
+#include <dirent.h>
 #include <elf.h>
 #include <errno.h>
 #include <linux/net.h>
 #include <linux/perf_event.h>
+#include <math.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syscall.h>
@@ -31,6 +34,7 @@
 #include "kernel_supplement.h"
 #include "log.h"
 #include "MagicSaveDataMonitor.h"
+#include "PreserveFileMonitor.h"
 #include "RecordSession.h"
 #include "record_signal.h"
 #include "ReplaySession.h"
@@ -40,27 +44,11 @@
 #include "StringVectorToCharArray.h"
 #include "util.h"
 
-/* The tracee doesn't open the desched event fd during replay, so it
- * can't be shared to this process.  We pretend that the tracee shared
- * this magic fd number with us and then give it a free pass for fd
- * checks that include this fd. */
-static const int REPLAY_DESCHED_EVENT_FD = -123;
-
 static const unsigned int NUM_X86_DEBUG_REGS = 8;
 static const unsigned int NUM_X86_WATCHPOINTS = 4;
 
 using namespace rr;
 using namespace std;
-
-/**
- * Format into |path| the path name at which syscallbuf shmem for
- * tracee |tid| will be allocated (briefly, until unlinked).
- */
-template <size_t N>
-void format_syscallbuf_shmem_path(pid_t tid, char (&path)[N]) {
-  static int nonce;
-  snprintf(path, N - 1, SYSCALLBUF_SHMEM_NAME_PREFIX "%d-%d", tid, nonce++);
-}
 
 /**
  * Stores the table of signal dispositions and metadata for an
@@ -76,16 +64,21 @@ struct Sighandler {
     sa.resize(sizeof(ksa));
     memcpy(sa.data(), &ksa, sizeof(ksa));
     resethand = (ksa.sa_flags & SA_RESETHAND) != 0;
+    takes_siginfo = (ksa.sa_flags & SA_SIGINFO) != 0;
   }
 
   template <typename Arch> void reset_arch() {
     typename Arch::kernel_sigaction ksa;
     memset(&ksa, 0, sizeof(ksa));
-    static_assert((uintptr_t)SIG_DFL == 0, "");
+    assert(uintptr_t(SIG_DFL) == 0);
     init_arch<Arch>(ksa);
   }
 
   bool ignored(int sig) const {
+    if (sig == SIGSTOP || sig == SIGKILL) {
+      // These can never be ignored
+      return false;
+    }
     return (uintptr_t)SIG_IGN == k_sa_handler.as_int() ||
            ((uintptr_t)SIG_DFL == k_sa_handler.as_int() &&
             IGNORE == default_action(sig));
@@ -94,18 +87,19 @@ struct Sighandler {
     return (uintptr_t)SIG_DFL == k_sa_handler.as_int() && !resethand;
   }
   bool is_user_handler() const {
-    static_assert(1 == (uintptr_t)SIG_IGN, "");
+    assert(1 == uintptr_t(SIG_IGN));
     return k_sa_handler.as_int() & ~(uintptr_t)SIG_IGN;
   }
-  remote_ptr<uint8_t> get_user_handler() const {
-    return is_user_handler() ? k_sa_handler.cast<uint8_t>()
-                             : remote_ptr<uint8_t>();
+  remote_code_ptr get_user_handler() const {
+    return is_user_handler() ? remote_code_ptr(k_sa_handler.as_int())
+                             : remote_code_ptr();
   }
 
   remote_ptr<void> k_sa_handler;
   // Saved kernel_sigaction; used to restore handler
   vector<uint8_t> sa;
   bool resethand;
+  bool takes_siginfo;
 };
 
 static void reset_handler(Sighandler* handler, SupportedArch arch) {
@@ -203,7 +197,7 @@ TaskGroup::TaskGroup(Session* session, TaskGroup* parent, pid_t tgid,
       real_tgid(real_tgid),
       exit_code(-1),
       dumpable(true),
-      session(session),
+      session_(session),
       parent_(parent),
       serial(serial) {
   LOG(debug) << "creating new task group " << tgid
@@ -215,8 +209,8 @@ TaskGroup::TaskGroup(Session* session, TaskGroup* parent, pid_t tgid,
 }
 
 TaskGroup::~TaskGroup() {
-  if (session) {
-    session->on_destroy(this);
+  if (session_) {
+    session_->on_destroy(this);
   }
   for (TaskGroup* tg : children) {
     tg->parent_ = nullptr;
@@ -228,13 +222,12 @@ TaskGroup::~TaskGroup() {
 
 Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
            int _priority, SupportedArch a)
-    : pseudo_blocked(false),
-      succ_event_counter(),
-      unstable(false),
+    : unstable(false),
       stable_exit(false),
       priority(_priority),
       in_round_robin_queue(false),
       emulated_stop_type(NOT_STOPPED),
+      sleeping_until(0),
       emulated_ptracer(nullptr),
       emulated_ptrace_stop_code(0),
       in_wait_type(WAIT_TYPE_NONE),
@@ -242,17 +235,17 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       scratch_size(),
       flushed_syscallbuf(false),
       delay_syscallbuf_reset(false),
-      delay_syscallbuf_flush(false),
       // This will be initialized when the syscall buffer is.
       desched_fd_child(-1),
       seccomp_bpf_enabled(false),
-      child_sig(),
-      stepped_into_syscall(false),
+      prctl_seccomp_status(0),
       hpc(_tid),
       tid(_tid),
       rec_tid(_rec_tid > 0 ? _rec_tid : _tid),
+      own_namespace_rec_tid(0),
       syscallbuf_hdr(),
       num_syscallbuf_bytes(),
+      stopping_breakpoint_table_entry_size(0),
       serial(serial),
       blocked_sigs(),
       prname("???"),
@@ -264,8 +257,6 @@ Task::Task(Session& session, pid_t _tid, pid_t _rec_tid, uint32_t serial,
       robust_futex_list(),
       robust_futex_list_len(),
       session_(&session),
-      thread_area(),
-      thread_area_valid(),
       tid_futex(),
       top_of_stack(),
       wait_status(),
@@ -305,8 +296,52 @@ Task::~Task() {
 
   destroy_local_buffers();
 
-  // We need the mem_fd in detach_and_reap().
-  detach_and_reap();
+  // child_mem_fd needs to be valid since we won't be able to open
+  // it for futex_wait below after we've detached.
+  ASSERT(this, as->mem_fd().is_open());
+
+  fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
+
+  if (unstable) {
+    // In addition to problems described in the long
+    // comment at the prototype of this function, unstable
+    // exits may result in the kernel *not* clearing the
+    // futex, for example for fatal signals.  So we would
+    // deadlock waiting on the futex.
+    LOG(warn) << tid << " is unstable; not blocking on its termination";
+    // This will probably leak a zombie process for rr's lifetime.
+    return;
+  }
+
+  ASSERT(this, seen_ptrace_exit_event);
+
+  if (tg->task_set().empty() && !session().is_recording()) {
+    // Reap the zombie.
+    int ret = waitpid(tg->real_tgid, NULL, __WALL);
+    if (ret == -1) {
+      ASSERT(this, errno == ECHILD || errno == ESRCH);
+    } else {
+      ASSERT(this, ret == tg->real_tgid);
+    }
+  }
+
+  if (!tid_futex.is_null() && as->task_set().size() > 0) {
+    // clone()'d tasks can have a pid_t* |ctid| argument
+    // that's written with the new task's pid.  That
+    // pointer can also be used as a futex: when the task
+    // dies, the original ctid value is cleared and a
+    // FUTEX_WAKE is done on the address. So
+    // pthread_join() is basically a standard futex wait
+    // loop.
+    LOG(debug) << "  waiting for tid futex " << tid_futex
+               << " to be cleared ...";
+    futex_wait(tid_futex, 0);
+  } else if (!tid_futex.is_null()) {
+    // There are no other live tasks in this address
+    // space, which means the address space just died
+    // along with our exit.  So we can't read the futex.
+    LOG(debug) << "  (can't futex_wait last task in vm)";
+  }
 
   LOG(debug) << "  dead";
 }
@@ -322,7 +357,7 @@ bool Task::at_may_restart_syscall() const {
 void Task::finish_emulated_syscall() {
   // XXX verify that this can't be interrupted by a breakpoint trap
   Registers r = regs();
-  remote_ptr<uint8_t> ip = r.ip();
+  remote_code_ptr ip = r.ip();
   bool known_idempotent_insn_after_syscall =
       (is_in_traced_syscall() || is_in_untraced_syscall());
 
@@ -342,9 +377,13 @@ void Task::finish_emulated_syscall() {
   // idempotent insn after the syscall trap (restore register
   // from stack), so we don't have to pay this expense.
   if (!known_idempotent_insn_after_syscall) {
-    vm()->add_breakpoint(ip, TRAP_BKPT_INTERNAL);
+    bool ok = vm()->add_breakpoint(ip, BKPT_INTERNAL);
+    ASSERT(this, ok) << "Can't add breakpoint???";
   }
-  cont_sysemu_singlestep();
+  // Passing RESUME_NO_TICKS here is not only a small performance optimization,
+  // but also avoids counting an event if the instruction immediately following
+  // a syscall instruction is a conditional branch.
+  resume_execution(RESUME_SYSEMU_SINGLESTEP, RESUME_WAIT, RESUME_NO_TICKS);
 
   if (!known_idempotent_insn_after_syscall) {
     // The breakpoint should raise SIGTRAP, but we can also see
@@ -352,7 +391,7 @@ void Task::finish_emulated_syscall() {
     ASSERT(this, (pending_sig() == SIGTRAP ||
                   ReplaySession::is_ignored_signal(pending_sig())))
         << "PENDING SIG IS " << signal_name(pending_sig());
-    vm()->remove_breakpoint(ip, TRAP_BKPT_INTERNAL);
+    vm()->remove_breakpoint(ip, BKPT_INTERNAL);
   }
   set_regs(r);
   wait_status = 0;
@@ -364,27 +403,16 @@ const struct syscallbuf_record* Task::desched_rec() const {
               : (EV_DESCHED == ev().type()) ? ev().Desched().rec : nullptr);
 }
 
-void Task::destabilize_task_group() {
-  // Only print this helper warning if there's (probably) a
-  // human around to see it.  This is done to avoid polluting
-  // output from tests.
-  if (EV_SIGNAL_DELIVERY == ev().type() && !probably_not_interactive()) {
-    /**
-     * In recording, Task is notified of a destabilizing signal event
-     * *after* it's been recorded, at the next trace-event-time.  In
-     * replay though we're notified at the occurrence of the signal.  So
-     * to display the same event time in logging across record/replay,
-     * apply this offset.
-     */
-    int signal_delivery_event_offset = session().is_recording() ? -1 : 0;
-    printf(
-        "[rr.%d] Warning: task %d (process %d) dying from fatal signal %s.\n",
-        trace_time() + signal_delivery_event_offset, rec_tid, tgid(),
-        signal_name(ev().Signal().siginfo.si_signo));
+bool Task::running_inside_desched() const {
+  for (auto& e : pending_events) {
+    if (e.type() == EV_DESCHED) {
+      return e.Desched().rec != desched_rec();
+    }
   }
-
-  tg->destabilize();
+  return false;
 }
+
+void Task::destabilize_task_group() { tg->destabilize(); }
 
 void Task::set_emulated_ptracer(Task* tracer) {
   if (tracer) {
@@ -556,20 +584,28 @@ void Task::dump(FILE* out) const {
   }
 }
 
-Task::FStatResult Task::fstat(int fd) {
+struct stat Task::stat_fd(int fd) {
   char path[PATH_MAX];
   snprintf(path, sizeof(path) - 1, "/proc/%d/fd/%d", tid, fd);
-  ScopedFd backing_fd(path, O_RDONLY);
-  ASSERT(this, backing_fd.is_open());
+  struct stat result;
+  auto ret = ::stat(path, &result);
+  ASSERT(this, ret == 0);
+  return result;
+}
+
+ScopedFd Task::open_fd(int fd, int flags) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path) - 1, "/proc/%d/fd/%d", tid, fd);
+  return ScopedFd(path, flags);
+}
+
+string Task::file_name_of_fd(int fd) {
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path) - 1, "/proc/%d/fd/%d", tid, fd);
   ssize_t nbytes = readlink(path, path, sizeof(path) - 1);
   ASSERT(this, nbytes >= 0);
   path[nbytes] = '\0';
-
-  FStatResult result;
-  auto ret = ::fstat(backing_fd, &result.st);
-  ASSERT(this, ret == 0);
-  result.file_name = path;
-  return result;
+  return path;
 }
 
 void Task::futex_wait(remote_ptr<int> futex, int val) {
@@ -578,7 +614,13 @@ void Task::futex_wait(remote_ptr<int> futex, int val) {
   // available kernel tools.
   //
   // TODO: find clever way to avoid busy-waiting.
-  while (val != read_mem(futex)) {
+  while (true) {
+    bool ok = true;
+    int mem = read_mem(futex, &ok);
+    if (!ok || val == mem) {
+      // Invalid addresses are just ignored by the kernel
+      break;
+    }
     // Try to give our scheduling slot to the kernel
     // thread that's going to write sync_addr.
     sched_yield();
@@ -593,6 +635,16 @@ pid_t Task::get_ptrace_eventmsg_pid() {
   // SYS_clone event, and us fetching the event message here.
   xptrace(PTRACE_GETEVENTMSG, nullptr, &msg);
   return (pid_t)msg;
+}
+
+uint16_t Task::get_ptrace_eventmsg_seccomp_data() {
+  unsigned long data = 0;
+  // in theory we could hit an assertion failure if the tracee suffers
+  // a SIGKILL before we get here. But the SIGKILL would have to be
+  // precisely timed between the generation of a PTRACE_EVENT_FORK/CLONE/
+  // SYS_clone event, and us fetching the event message here.
+  xptrace(PTRACE_GETEVENTMSG, nullptr, &data);
+  return data;
 }
 
 const siginfo_t& Task::get_siginfo() {
@@ -613,8 +665,7 @@ RecordSession& Task::record_session() const { return *session().as_record(); }
 ReplaySession& Task::replay_session() const { return *session().as_replay(); }
 
 template <typename Arch>
-void Task::init_buffers_arch(remote_ptr<void> map_hint,
-                             ShareDeschedEventFd share_desched_fd) {
+void Task::init_buffers_arch(remote_ptr<void> map_hint) {
   // NB: the tracee can't be interrupted with a signal while
   // we're processing the rrcall, because it's masked off all
   // signals.
@@ -628,11 +679,11 @@ void Task::init_buffers_arch(remote_ptr<void> map_hint,
   if (as->syscallbuf_enabled()) {
     init_syscall_buffer(remote, map_hint);
     args.syscallbuf_ptr = syscallbuf_child;
-    if (share_desched_fd == SHARE_DESCHED_EVENT_FD) {
-      desched_fd_child = args.desched_counter_fd;
+    desched_fd_child = args.desched_counter_fd;
+    // Prevent the child from closing this fd
+    fds->add_monitor(desched_fd_child, new PreserveFileMonitor());
+    if (session().is_recording()) {
       desched_fd = remote.retrieve_fd(desched_fd_child);
-    } else {
-      desched_fd_child = REPLAY_DESCHED_EVENT_FD;
     }
   } else {
     args.syscallbuf_ptr = remote_ptr<void>(nullptr);
@@ -646,23 +697,28 @@ void Task::init_buffers_arch(remote_ptr<void> map_hint,
   // away in the return value slot so that we can easily check
   // that we map the segment at the same addr during replay.
   remote.regs().set_syscall_result(syscallbuf_child);
-  syscallbuf_hdr->locked = is_desched_sig_blocked();
 }
 
-void Task::init_buffers(remote_ptr<void> map_hint,
-                        ShareDeschedEventFd share_desched_fd) {
-  RR_ARCH_FUNCTION(init_buffers_arch, arch(), map_hint, share_desched_fd);
+void Task::init_buffers(remote_ptr<void> map_hint) {
+  RR_ARCH_FUNCTION(init_buffers_arch, arch(), map_hint);
 }
 
 void Task::destroy_buffers() {
   AutoRemoteSyscalls remote(this);
-  remote.syscall(syscall_number_for_munmap(arch()), scratch_ptr, scratch_size);
+  remote.infallible_syscall(syscall_number_for_munmap(arch()), scratch_ptr,
+                            scratch_size);
   vm()->unmap(scratch_ptr, scratch_size);
   if (!syscallbuf_child.is_null()) {
-    remote.syscall(syscall_number_for_munmap(arch()), syscallbuf_child,
-                   num_syscallbuf_bytes);
+    remote.infallible_syscall(syscall_number_for_munmap(arch()),
+                              syscallbuf_child, num_syscallbuf_bytes);
     vm()->unmap(syscallbuf_child, num_syscallbuf_bytes);
-    remote.syscall(syscall_number_for_close(arch()), desched_fd_child);
+    if (desched_fd_child >= 0) {
+      if (session().is_recording()) {
+        remote.infallible_syscall(syscall_number_for_close(arch()),
+                                  desched_fd_child);
+      }
+      fds->did_close(desched_fd_child);
+    }
   }
 }
 
@@ -672,26 +728,12 @@ bool Task::is_arm_desched_event_syscall() {
 
 bool Task::is_desched_event_syscall() {
   return is_ioctl_syscall(regs().original_syscallno(), arch()) &&
-         (desched_fd_child == (int)regs().arg1_signed() ||
-          desched_fd_child == REPLAY_DESCHED_EVENT_FD);
+         desched_fd_child == (int)regs().arg1_signed();
 }
 
 bool Task::is_disarm_desched_event_syscall() {
   return (is_desched_event_syscall() &&
           PERF_EVENT_IOC_DISABLE == regs().arg2());
-}
-
-bool Task::is_probably_replaying_syscall() {
-  assert(session().is_replaying());
-  // If the tracee is at our syscall entry points, we know for
-  // sure it's entering/exiting/just-exited a syscall.
-  return (is_in_traced_syscall() || is_in_untraced_syscall()
-          // Otherwise, we assume that if original_syscallno() has been
-          // saved from syscallno(), then the tracee is in a syscall.
-          // This seems to be the heuristic used by the linux
-          // kernel for /proc/PID/syscall.
-          ||
-          regs().original_syscallno() >= 0);
 }
 
 bool Task::is_ptrace_seccomp_event() const {
@@ -706,6 +748,11 @@ bool Task::is_sig_blocked(int sig) const {
     return (*sigsuspend_blocked_sigs >> sig_bit) & 1;
   }
   return (blocked_sigs >> sig_bit) & 1;
+}
+
+void Task::set_sig_blocked(int sig) {
+  int sig_bit = sig - 1;
+  blocked_sigs |= (sig_set_t)1 << sig_bit;
 }
 
 bool Task::is_sig_ignored(int sig) const {
@@ -788,35 +835,27 @@ void Task::log_pending_events() const {
 }
 
 bool Task::may_be_blocked() const {
-  return EV_SYSCALL == ev().type() &&
-         PROCESSING_SYSCALL == ev().Syscall().state;
+  return (EV_SYSCALL == ev().type() &&
+          PROCESSING_SYSCALL == ev().Syscall().state) ||
+         emulated_stop_type != NOT_STOPPED;
 }
 
 template <typename Arch>
 void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
   session().accumulate_syscall_performed();
 
+  // mprotect can change the protection status of some mapped regions before
+  // failing.
   if (regs.syscall_failed() && !is_mprotect_syscall(syscallno, arch())) {
     return;
   }
 
   switch (syscallno) {
-    case Arch::brk: {
-      remote_ptr<void> addr = regs.arg1();
-      if (!addr) {
-        // A brk() update of nullptr is observed with
-        // libc, which apparently is its means of
-        // finding out the initial brk().  We can
-        // ignore that for the purposes of updating
-        // our address space.
-        return;
-      }
-      return vm()->brk(addr);
-    }
+    case Arch::brk:
     case Arch::mmap:
     case Arch::mmap2: {
       LOG(debug)
-          << "(mmap/mmap2 will receive / has received direct processing)";
+          << "(brk/mmap/mmap2 will receive / has received direct processing)";
       return;
     }
     case Arch::mprotect: {
@@ -840,16 +879,22 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     case Arch::shmdt: {
       remote_ptr<void> addr = regs.arg1();
       auto mapping = vm()->mapping_of(addr);
-      ASSERT(this, mapping.first.start == addr);
-      return vm()->unmap(addr, mapping.first.end - addr);
+      ASSERT(this, mapping.map.start() == addr);
+      return vm()->unmap(addr, mapping.map.end() - addr);
+    }
+    case Arch::madvise: {
+      remote_ptr<void> addr = regs.arg1();
+      size_t num_bytes = regs.arg2();
+      int advice = regs.arg3();
+      return vm()->advise(addr, num_bytes, advice);
     }
     case Arch::ipc: {
       switch ((int)regs.arg1_signed()) {
         case SHMDT: {
           remote_ptr<void> addr = regs.arg5();
           auto mapping = vm()->mapping_of(addr);
-          ASSERT(this, mapping.first.start == addr);
-          return vm()->unmap(addr, mapping.first.end - addr);
+          ASSERT(this, mapping.map.start() == addr);
+          return vm()->unmap(addr, mapping.map.end() - addr);
         }
         default:
           break;
@@ -879,10 +924,23 @@ void Task::on_syscall_exit_arch(int syscallno, const Registers& regs) {
     case Arch::dup:
     case Arch::dup2:
     case Arch::dup3:
-      fd_table()->dup(regs.arg1(), regs.syscall_result());
+      fd_table()->did_dup(regs.arg1(), regs.syscall_result());
+      return;
+    case Arch::fcntl64:
+    case Arch::fcntl:
+      if (regs.arg2() == Arch::DUPFD || regs.arg2() == Arch::DUPFD_CLOEXEC) {
+        fd_table()->did_dup(regs.arg1(), regs.syscall_result());
+      }
       return;
     case Arch::close:
-      fd_table()->close(regs.arg1());
+      fd_table()->did_close(regs.arg1());
+      return;
+
+    case Arch::unshare:
+      if (regs.arg1() & CLONE_FILES) {
+        fds->erase_task(this);
+        fds = fds->clone(this);
+      }
       return;
 
     case Arch::write: {
@@ -923,14 +981,49 @@ void Task::on_syscall_exit(int syscallno, const Registers& regs) {
 void Task::move_ip_before_breakpoint() {
   // TODO: assert that this is at a breakpoint trap.
   Registers r = regs();
-  r.set_ip(r.ip() - sizeof(AddressSpace::breakpoint_insn));
+  r.set_ip(r.ip().decrement_by_bkpt_insn_length(arch()));
+  set_regs(r);
+}
+
+void Task::advance_syscall() {
+  while (true) {
+    resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
+    if (is_ptrace_seccomp_event()) {
+      continue;
+    }
+    ASSERT(this, ptrace_event() == 0);
+    if (!pending_sig()) {
+      break;
+    }
+    if (ReplaySession::is_ignored_signal(pending_sig()) &&
+        session().is_replaying()) {
+      continue;
+    }
+    ASSERT(this, session().is_recording());
+    stash_sig();
+  }
+}
+
+void Task::exit_syscall_and_prepare_restart() {
+  Registers r = regs();
+  int syscallno = r.original_syscallno();
+  r.set_original_syscallno(syscall_number_for_gettid(r.arch()));
+  set_regs(r);
+  // This exits the hijacked SYS_gettid.  Now the tracee is
+  // ready to do our bidding.
+  advance_syscall();
+
+  // Restore these regs to what they would have been just before
+  // the tracee trapped at the syscall.
+  r.set_original_syscallno(-1);
+  r.set_syscallno(syscallno);
+  r.set_ip(r.ip() - syscall_instruction_length(r.arch()));
   set_regs(r);
 }
 
 static string prname_from_exe_image(const string& e) {
   size_t last_slash = e.rfind('/');
-  string basename = (last_slash != e.npos) ? e.substr(last_slash + 1) : e;
-  return basename.substr(0, 15);
+  return e.substr(last_slash == e.npos ? 0 : last_slash + 1);
 }
 
 static SupportedArch determine_arch(Task* t, const string& file_name) {
@@ -962,7 +1055,8 @@ static string exe_path(Task* t) {
 }
 
 void Task::post_exec(const Registers* replay_regs,
-                     const ExtraRegisters* replay_extra_regs) {
+                     const ExtraRegisters* replay_extra_regs,
+                     const string* replay_exe) {
   /* We just saw a successful exec(), so from now on we know
    * that the address space layout for the replay tasks will
    * (should!) be the same as for the recorded tasks.  So we can
@@ -972,27 +1066,24 @@ void Task::post_exec(const Registers* replay_regs,
   as->erase_task(this);
   fds->erase_task(this);
 
-  string exe_file = exe_path(this);
-  if (replay_regs) {
-    registers = *replay_regs;
-    extra_registers = *replay_extra_regs;
-    ASSERT(this, !extra_registers.empty());
-  } else {
-    registers.set_arch(determine_arch(this, exe_file));
-    extra_registers.set_arch(registers.arch());
-    // Read registers now that the architecture is known.
-    struct user_regs_struct ptrace_regs;
-    ptrace_if_alive(PTRACE_GETREGS, nullptr, &ptrace_regs);
-    registers.set_from_ptrace(ptrace_regs);
-    // Change syscall number to execve *for the new arch*. If we don't do this,
-    // and the arch changes, then the syscall number for execve in the old arch/
-    // is treated as the syscall we're executing in the new arch, with hilarious
-    // results.
-    registers.set_original_syscallno(syscall_number_for_execve(arch()));
+  string exe_file = replay_exe ? *replay_exe : exe_path(this);
+  registers.set_arch(determine_arch(this, exe_file));
+  extra_registers.set_arch(registers.arch());
+  // Read registers now that the architecture is known.
+  struct user_regs_struct ptrace_regs;
+  ptrace_if_alive(PTRACE_GETREGS, nullptr, &ptrace_regs);
+  registers.set_from_ptrace(ptrace_regs);
+  // Change syscall number to execve *for the new arch*. If we don't do this,
+  // and the arch changes, then the syscall number for execve in the old arch/
+  // is treated as the syscall we're executing in the new arch, with hilarious
+  // results.
+  registers.set_original_syscallno(syscall_number_for_execve(arch()));
+  set_regs(registers);
+
+  if (!replay_regs) {
     ev().set_arch(arch());
     ev().Syscall().number = registers.original_syscallno();
   }
-  set_regs(registers);
 
   // Clear robust_list state to match kernel state. If this task is cloned
   // soon after exec, we must not do a bogus set_robust_list syscall for
@@ -1004,10 +1095,22 @@ void Task::post_exec(const Registers* replay_regs,
   sighandlers = sighandlers->clone();
   sighandlers->reset_user_handlers(arch());
 
+  thread_areas_.clear();
+
   as = session().create_vm(this, exe_file, as->uid().exec_count() + 1);
   // It's barely-documented, but Linux unshares the fd table on exec
   fds = fds->clone(this);
   prname = prname_from_exe_image(as->exe_image());
+
+  if (replay_regs) {
+    // Delay setting the replay_regs until here so the original registers
+    // are set while we populate AddressSpace. We need that for the kernel
+    // to identify the original stack region correctly.
+    registers = *replay_regs;
+    extra_registers = *replay_extra_regs;
+    ASSERT(this, !extra_registers.empty());
+    set_regs(registers);
+  }
 }
 
 void Task::post_exec_syscall(TraceTaskEvent& event) {
@@ -1026,10 +1129,9 @@ static bool record_extra_regs(const Event& ev) {
   switch (ev.type()) {
     case EV_SYSCALL:
       // sigreturn/rt_sigreturn restores register state
-      return (is_sigreturn(ev.Syscall().number, ev.arch()) &&
-              ev.Syscall().state == EXITING_SYSCALL) ||
-             (is_execve_syscall(ev.Syscall().number, ev.arch()) &&
-              ev.Syscall().state == ENTERING_SYSCALL);
+      return ev.Syscall().state == EXITING_SYSCALL &&
+             (is_sigreturn(ev.Syscall().number, ev.arch()) ||
+              is_execve_syscall(ev.Syscall().number, ev.arch()));
     case EV_SIGNAL_HANDLER:
       // entering a signal handler seems to clear FP/SSE regs,
       // so record these effects.
@@ -1039,8 +1141,24 @@ static bool record_extra_regs(const Event& ev) {
   }
 }
 
-void Task::record_event(const Event& ev) {
-  maybe_flush_syscallbuf();
+/**
+ * If the syscallbuf has just been flushed, and resetting hasn't been
+ * overridden with a delay request, then record the reset event for
+ * replay.
+ */
+void Task::maybe_reset_syscallbuf() {
+  if (flushed_syscallbuf && !delay_syscallbuf_reset) {
+    flushed_syscallbuf = false;
+    LOG(debug) << "Syscallbuf reset";
+    reset_syscallbuf();
+    record_event(Event(EV_SYSCALLBUF_RESET, NO_EXEC_INFO, arch()));
+  }
+}
+
+void Task::record_event(const Event& ev, FlushSyscallbuf flush) {
+  if (flush == FLUSH_SYSCALLBUF) {
+    maybe_flush_syscallbuf();
+  }
 
   TraceFrame frame(trace_writer().time(), tid, ev, tick_count());
   if (ev.record_exec_info() == HAS_EXEC_INFO) {
@@ -1054,14 +1172,26 @@ void Task::record_event(const Event& ev) {
                         record_extra_regs(ev) ? &extra_regs() : nullptr);
   }
 
-  if (should_dump_memory(this, frame)) {
+  if (should_dump_memory(frame)) {
     dump_process_memory(this, frame.time(), "rec");
   }
-  if (should_checksum(this, frame)) {
+  if (should_checksum(frame)) {
     checksum_process_memory(this, frame.time());
   }
 
   trace_writer().write_frame(frame);
+
+  if (!ev.has_ticks_slop()) {
+    ASSERT(this, flush == FLUSH_SYSCALLBUF);
+    // After we've output an event, it's safe to reset the syscallbuf (if not
+    // explicitly delayed) since we will have exited the syscallbuf code that
+    // consumed the syscallbuf data.
+    // This only works if the event has a reliable tick count so when we
+    // reach it, we're done.
+    maybe_reset_syscallbuf();
+  }
+
+  registers_at_start_of_uninterrupted_timeslice = nullptr;
 }
 
 void Task::flush_inconsistent_state() { ticks = 0; }
@@ -1072,7 +1202,7 @@ void Task::record_local(remote_ptr<void> addr, ssize_t num_bytes,
                         const void* data) {
   maybe_flush_syscallbuf();
 
-  assert(num_bytes >= 0);
+  ASSERT(this, num_bytes >= 0);
 
   if (!addr) {
     return;
@@ -1082,10 +1212,10 @@ void Task::record_local(remote_ptr<void> addr, ssize_t num_bytes,
 }
 
 void Task::record_remote(remote_ptr<void> addr, ssize_t num_bytes) {
+  maybe_flush_syscallbuf();
+
   // We shouldn't be recording a scratch address.
   ASSERT(this, !addr || addr != scratch_ptr);
-
-  maybe_flush_syscallbuf();
 
   assert(num_bytes >= 0);
 
@@ -1097,12 +1227,28 @@ void Task::record_remote(remote_ptr<void> addr, ssize_t num_bytes) {
   trace_writer().write_raw(buf.data(), num_bytes, addr);
 }
 
-void Task::record_remote_even_if_null(remote_ptr<void> addr,
-                                      ssize_t num_bytes) {
+void Task::record_remote_fallible(remote_ptr<void> addr, ssize_t num_bytes) {
+  maybe_flush_syscallbuf();
+
   // We shouldn't be recording a scratch address.
   ASSERT(this, !addr || addr != scratch_ptr);
+  ASSERT(this, num_bytes >= 0);
 
+  vector<uint8_t> buf;
+  if (!addr.is_null()) {
+    buf.resize(num_bytes);
+    ssize_t nread = read_bytes_fallible(addr, num_bytes, buf.data());
+    buf.resize(max<ssize_t>(0, nread));
+  }
+  trace_writer().write_raw(buf.data(), buf.size(), addr);
+}
+
+void Task::record_remote_even_if_null(remote_ptr<void> addr,
+                                      ssize_t num_bytes) {
   maybe_flush_syscallbuf();
+
+  // We shouldn't be recording a scratch address.
+  ASSERT(this, !addr || addr != scratch_ptr);
 
   assert(num_bytes >= 0);
 
@@ -1115,36 +1261,25 @@ void Task::record_remote_even_if_null(remote_ptr<void> addr,
   trace_writer().write_raw(buf.data(), num_bytes, addr);
 }
 
-void Task::record_remote_str(remote_ptr<void> str) {
-  maybe_flush_syscallbuf();
-
-  if (!str) {
-    return;
-  }
-
-  string s = read_c_str(str);
-  // Record the \0 byte.
-  trace_writer().write_raw(s.c_str(), s.size() + 1, str);
-}
-
-string Task::read_c_str(remote_ptr<void> child_addr) {
+string Task::read_c_str(remote_ptr<char> child_addr) {
   // XXX handle invalid C strings
+  remote_ptr<void> p = child_addr;
   string str;
   while (true) {
     // We're only guaranteed that [child_addr,
     // end_of_page) is mapped.
-    remote_ptr<void> end_of_page = ceil_page_size(child_addr + 1);
-    ssize_t nbytes = end_of_page - child_addr;
+    remote_ptr<void> end_of_page = ceil_page_size(p + 1);
+    ssize_t nbytes = end_of_page - p;
     char buf[nbytes];
 
-    read_bytes_helper(child_addr, nbytes, buf);
+    read_bytes_helper(p, nbytes, buf);
     for (int i = 0; i < nbytes; ++i) {
       if ('\0' == buf[i]) {
         return str;
       }
       str += buf[i];
     }
-    child_addr = end_of_page;
+    p = end_of_page;
   }
 }
 
@@ -1183,9 +1318,9 @@ const ExtraRegisters& Task::extra_regs() {
       LOG(debug) << "  (refreshing extra-register cache using XSAVE)";
 
       extra_registers.format_ = ExtraRegisters::XSAVE;
-      extra_registers.data.resize(xsave_area_size);
-      struct iovec vec = { extra_registers.data.data(),
-                           extra_registers.data.size() };
+      extra_registers.data_.resize(xsave_area_size);
+      struct iovec vec = { extra_registers.data_.data(),
+                           extra_registers.data_.size() };
       xptrace(PTRACE_GETREGSET, NT_X86_XSTATE, &vec);
       ASSERT(this, vec.iov_len == xsave_area_size)
           << "Didn't get enough register data; expected " << xsave_area_size
@@ -1195,16 +1330,16 @@ const ExtraRegisters& Task::extra_regs() {
       LOG(debug) << "  (refreshing extra-register cache using FPXREGS)";
 
       extra_registers.format_ = ExtraRegisters::XSAVE;
-      extra_registers.data.resize(sizeof(user_fpxregs_struct));
-      xptrace(PTRACE_GETFPXREGS, nullptr, extra_registers.data.data());
+      extra_registers.data_.resize(sizeof(user_fpxregs_struct));
+      xptrace(PTRACE_GETFPXREGS, nullptr, extra_registers.data_.data_());
 #elif defined(__x86_64__)
       // x86-64 that doesn't support XSAVE; apparently Xeon E5620 (Westmere)
       // is in this class.
       LOG(debug) << "  (refreshing extra-register cache using FPREGS)";
 
       extra_registers.format_ = ExtraRegisters::XSAVE;
-      extra_registers.data.resize(sizeof(user_fpregs_struct));
-      xptrace(PTRACE_GETFPREGS, nullptr, extra_registers.data.data());
+      extra_registers.data_.resize(sizeof(user_fpregs_struct));
+      xptrace(PTRACE_GETFPREGS, nullptr, extra_registers.data_.data());
 #else
 #error need to define new extra_regs support
 #endif
@@ -1218,7 +1353,7 @@ const ExtraRegisters& Task::extra_regs() {
 void Task::validate_regs(uint32_t flags) {
   /* don't validate anything before execve is done as the actual
    * process did not start prior to this point */
-  if (!session().can_validate()) {
+  if (!session().done_initial_exec()) {
     return;
   }
 
@@ -1227,8 +1362,9 @@ void Task::validate_regs(uint32_t flags) {
   if (flags & IGNORE_ESI) {
     if (regs().arg4() != rec_regs.arg4()) {
       LOG(warn) << "Probably saw kernel bug mutating $esi across pread/write64 "
-                   "call: recorded:" << HEX(rec_regs.arg4())
-                << "; replaying:" << regs().arg4() << ".  Fudging registers.";
+                   "call: recorded:"
+                << HEX(rec_regs.arg4()) << "; replaying:" << regs().arg4()
+                << ".  Fudging registers.";
       rec_regs.set_arg4(regs().arg4());
     }
   }
@@ -1289,15 +1425,58 @@ uintptr_t Task::debug_status() {
   return fallible_ptrace(PTRACE_PEEKUSER, dr_user_word_offset(6), nullptr);
 }
 
-uintptr_t Task::consume_debug_status() {
-  uintptr_t status =
-      fallible_ptrace(PTRACE_PEEKUSER, dr_user_word_offset(6), nullptr);
-  fallible_ptrace(PTRACE_POKEUSER, dr_user_word_offset(6), 0);
-  return status;
+void Task::set_debug_status(uintptr_t status) {
+  fallible_ptrace(PTRACE_POKEUSER, dr_user_word_offset(6), (void*)status);
 }
 
-void Task::replace_debug_status(uintptr_t status) {
-  fallible_ptrace(PTRACE_POKEUSER, dr_user_word_offset(6), (void*)status);
+TrapReasons Task::compute_trap_reasons() {
+  ASSERT(this, pending_sig() == SIGTRAP);
+  TrapReasons reasons;
+  uintptr_t status = debug_status();
+
+  reasons.singlestep = (status & DS_SINGLESTEP) != 0;
+
+  // In VMWare Player 6.0.4 build-2249910, 32-bit Ubuntu x86 guest,
+  // single-stepping does not trigger watchpoints :-(. So we have to
+  // check watchpoints here. fast_forward also hides watchpoint changes.
+  // Write-watchpoints will detect that their value has changed and trigger.
+  // XXX Read/exec watchpoints can't be detected this way so they're still
+  // broken in the above configuration :-(.
+  if ((DS_WATCHPOINT_ANY | DS_SINGLESTEP) & status) {
+    as->notify_watchpoint_fired(status);
+  }
+  reasons.watchpoint =
+      as->has_any_watchpoint_changes() || (DS_WATCHPOINT_ANY & status);
+
+  // If we triggered a breakpoint, this would be the address of the breakpoint
+  remote_code_ptr ip_at_breakpoint = ip().decrement_by_bkpt_insn_length(arch());
+  // Don't trust siginfo to report execution of a breakpoint if singlestep or
+  // watchpoint triggered.
+  if (reasons.singlestep) {
+    reasons.breakpoint =
+        as->is_breakpoint_instruction(this, address_of_last_execution_resume);
+    if (reasons.breakpoint) {
+      ASSERT(this, address_of_last_execution_resume == ip_at_breakpoint);
+    }
+  } else if (reasons.watchpoint) {
+    // We didn't singlestep, so watchpoint state is completely accurate.
+    // The only way the last instruction could have triggered a watchpoint
+    // and be a breakpoint instruction is if an EXEC watchpoint fired
+    // at the breakpoint address.
+    reasons.breakpoint = as->has_exec_watchpoint_fired(ip_at_breakpoint) &&
+                         as->is_breakpoint_instruction(this, ip_at_breakpoint);
+  } else {
+    const siginfo_t& si = get_siginfo();
+    ASSERT(this, SIGTRAP == si.si_signo);
+    /* XXX unable to find docs on which of these "should" be
+     * right.  The SI_KERNEL code is seen in the int3 test, so we
+     * at least need to handle that. */
+    reasons.breakpoint = SI_KERNEL == si.si_code || TRAP_BRKPT == si.si_code;
+    if (reasons.breakpoint) {
+      ASSERT(this, as->is_breakpoint_instruction(this, ip_at_breakpoint));
+    }
+  }
+  return reasons;
 }
 
 remote_ptr<void> Task::watchpoint_addr(size_t i) {
@@ -1313,16 +1492,23 @@ void Task::remote_memcpy(remote_ptr<void> dst, remote_ptr<void> src,
   write_bytes_helper(dst, num_bytes, buf);
 }
 
-void Task::resume_execution(ResumeRequest how, WaitRequest wait_how, int sig,
-                            Ticks tick_period) {
-  // Treat a 0 tick_period as a very large but finite number.
+void Task::resume_execution(ResumeRequest how, WaitRequest wait_how,
+                            TicksRequest tick_period, int sig) {
+  // Treat a RESUME_NO_TICKS tick_period as a very large but finite number.
   // Always resetting here, and always to a nonzero number, improves
   // consistency between recording and replay and hopefully
   // makes counting bugs behave similarly between recording and
   // replay.
   // Accumulate any unknown stuff in tick_count().
-  hpc.reset(tick_period == 0 ? 0xffffffff : tick_period);
-  LOG(debug) << "resuming execution with " << ptrace_req_name(how);
+  if (tick_period != RESUME_NO_TICKS) {
+    hpc.reset(tick_period == RESUME_UNLIMITED_TICKS
+                  ? 0xffffffff
+                  : max<Ticks>(1, tick_period));
+  }
+  LOG(debug) << "resuming execution with " << ptrace_req_name(how)
+             << (sig ? string(", signal ") + signal_name(sig) : string());
+  address_of_last_execution_resume = ip();
+  set_debug_status(0);
   ptrace_if_alive(how, nullptr, (void*)(uintptr_t)sig);
   is_stopped = false;
   extra_registers_known = false;
@@ -1355,6 +1541,10 @@ void Task::apply_all_data_records_from_trace() {
 void Task::set_return_value_from_trace() {
   Registers r = regs();
   r.set_syscall_result(current_trace_frame().regs().syscall_result());
+  // In some cases (e.g. syscalls forced to return an error by tracee
+  // seccomp filters) we need to emulate a change to the original_syscallno
+  // (to -1 in that case).
+  r.set_original_syscallno(current_trace_frame().regs().original_syscallno());
   set_regs(r);
 }
 
@@ -1375,15 +1565,16 @@ void Task::set_extra_regs(const ExtraRegisters& regs) {
   switch (extra_registers.format()) {
     case ExtraRegisters::XSAVE: {
       if (xsave_area_size) {
-        struct iovec vec = { extra_registers.data.data(),
-                             extra_registers.data.size() };
+        struct iovec vec = { extra_registers.data_.data(),
+                             extra_registers.data_.size() };
         ptrace_if_alive(PTRACE_SETREGSET, NT_X86_XSTATE, &vec);
       } else {
 #if defined(__i386__)
         ptrace_if_alive(PTRACE_SETFPXREGS, nullptr,
-                        extra_registers.data.data());
+                        extra_registers.data_.data_());
 #elif defined(__x86_64__)
-        ptrace_if_alive(PTRACE_SETFPREGS, nullptr, extra_registers.data.data());
+        ptrace_if_alive(PTRACE_SETFPREGS, nullptr,
+                        extra_registers.data_.data());
 #else
 #error Unsupported architecture
 #endif
@@ -1440,7 +1631,8 @@ bool Task::set_debug_regs(const DebugRegs& regs) {
     WatchBytesX86 dr2_len : 2;
     WatchType dr3_type : 2;
     WatchBytesX86 dr3_len : 2;
-  } dr7 = { 0 };
+  } dr7;
+  memset(&dr7, 0, sizeof(dr7));
   static_assert(sizeof(DebugControl) == sizeof(uintptr_t),
                 "Can't pack DebugControl");
 
@@ -1491,13 +1683,16 @@ uintptr_t Task::get_debug_reg(size_t regno) {
   return result;
 }
 
-void Task::set_thread_area(remote_ptr<void> tls) {
-  thread_area = read_mem(tls.cast<struct user_desc>());
-  thread_area_valid = true;
-}
-
-const struct user_desc* Task::tls() const {
-  return thread_area_valid ? &thread_area : nullptr;
+void Task::set_thread_area(remote_ptr<struct user_desc> tls) {
+  // We rely on the fact that user_desc is word-size-independent.
+  auto desc = read_mem(tls);
+  for (auto& t : thread_areas_) {
+    if (t.entry_number == desc.entry_number) {
+      t = desc;
+      return;
+    }
+  }
+  thread_areas_.push_back(desc);
 }
 
 void Task::set_tid_addr(remote_ptr<int> tid_addr) {
@@ -1511,26 +1706,28 @@ void Task::signal_delivered(int sig) {
     reset_handler(&h, arch());
   }
 
-  switch (sig) {
-    case SIGSTOP:
-    case SIGTSTP:
-    case SIGTTIN:
-    case SIGTTOU:
-      // All threads in the process are stopped.
-      for (Task* t : tg->task_set()) {
-        LOG(debug) << "setting " << tid << " to GROUP_STOP due to signal "
-                   << sig;
-        t->emulated_stop_type = GROUP_STOP;
-      }
-      break;
-    case SIGCONT:
-      // All threads in the process are resumed.
-      for (Task* t : tg->task_set()) {
-        LOG(debug) << "setting " << tid << " to NOT_STOPPED due to signal "
-                   << sig;
-        t->emulated_stop_type = NOT_STOPPED;
-      }
-      break;
+  if (!h.ignored(sig)) {
+    switch (sig) {
+      case SIGSTOP:
+      case SIGTSTP:
+      case SIGTTIN:
+      case SIGTTOU:
+        // All threads in the process are stopped.
+        for (Task* t : tg->task_set()) {
+          LOG(debug) << "setting " << tid << " to GROUP_STOP due to signal "
+                     << sig;
+          t->emulated_stop_type = GROUP_STOP;
+        }
+        break;
+      case SIGCONT:
+        // All threads in the process are resumed.
+        for (Task* t : tg->task_set()) {
+          LOG(debug) << "setting " << tid << " to NOT_STOPPED due to signal "
+                     << sig;
+          t->emulated_stop_type = NOT_STOPPED;
+        }
+        break;
+    }
   }
 
   send_synthetic_SIGCHLD_if_necessary();
@@ -1540,7 +1737,7 @@ bool Task::signal_has_user_handler(int sig) const {
   return sighandlers->get(sig).is_user_handler();
 }
 
-remote_ptr<uint8_t> Task::get_signal_user_handler(int sig) const {
+remote_code_ptr Task::get_signal_user_handler(int sig) const {
   return sighandlers->get(sig).get_user_handler();
 }
 
@@ -1548,15 +1745,19 @@ const vector<uint8_t>& Task::signal_action(int sig) const {
   return sighandlers->get(sig).sa;
 }
 
+bool Task::signal_handler_takes_siginfo(int sig) const {
+  return sighandlers->get(sig).takes_siginfo;
+}
+
 void Task::stash_sig() {
   int sig = pending_sig();
-  assert(sig);
+  ASSERT(this, sig);
   // Callers should avoid passing SYSCALLBUF_DESCHED_SIGNAL in here.
-  assert(sig != SYSCALLBUF_DESCHED_SIGNAL);
+  ASSERT(this, sig != SYSCALLBUF_DESCHED_SIGNAL);
   // multiple non-RT signals coalesce
   if (sig < SIGRTMIN) {
     for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
-      if (it->si.si_signo == sig) {
+      if (it->si_signo == sig) {
         LOG(debug) << "discarding stashed signal " << sig
                    << " since we already have one pending";
         return;
@@ -1565,20 +1766,63 @@ void Task::stash_sig() {
   }
 
   const siginfo_t& si = get_siginfo();
-  stashed_signals.push_back(StashedSignal(si));
+  stashed_signals.push_back(si);
   wait_status = 0;
 }
 
-siginfo_t Task::pop_stash_sig() {
+void Task::stash_synthetic_sig(const siginfo_t& si) {
+  int sig = si.si_signo;
+  assert(sig);
+  // Callers should avoid passing SYSCALLBUF_DESCHED_SIGNAL in here.
+  assert(sig != SYSCALLBUF_DESCHED_SIGNAL);
+  // multiple non-RT signals coalesce
+  if (sig < SIGRTMIN) {
+    for (auto it = stashed_signals.begin(); it != stashed_signals.end(); ++it) {
+      if (it->si_signo == sig) {
+        LOG(debug) << "discarding stashed signal " << sig
+                   << " since we already have one pending";
+        return;
+      }
+    }
+  }
+
+  stashed_signals.push_back(si);
+}
+
+void Task::pop_stash_sig() {
   assert(has_stashed_sig());
-  siginfo_t si = stashed_signals.front().si;
   stashed_signals.pop_front();
-  return si;
 }
 
 siginfo_t Task::peek_stash_sig() {
   assert(has_stashed_sig());
-  return stashed_signals.front().si;
+  return stashed_signals.front();
+}
+
+void Task::save_ptrace_signal_siginfo(const siginfo_t& si) {
+  for (auto it = saved_ptrace_siginfos.begin();
+       it != saved_ptrace_siginfos.end(); ++it) {
+    if (it->si_signo == si.si_signo) {
+      saved_ptrace_siginfos.erase(it);
+      break;
+    }
+  }
+  saved_ptrace_siginfos.push_back(si);
+}
+
+siginfo_t Task::take_ptrace_signal_siginfo(int sig) {
+  for (auto it = saved_ptrace_siginfos.begin();
+       it != saved_ptrace_siginfos.end(); ++it) {
+    if (it->si_signo == sig) {
+      siginfo_t si = *it;
+      saved_ptrace_siginfos.erase(it);
+      return si;
+    }
+  }
+  siginfo_t si;
+  memset(&si, 0, sizeof(si));
+  si.si_signo = sig;
+  return si;
 }
 
 const string& Task::trace_dir() const {
@@ -1632,10 +1876,6 @@ void Task::update_sigmask(const Registers& regs) {
     return;
   }
 
-  ASSERT(this, (!syscallbuf_hdr || !syscallbuf_hdr->locked ||
-                is_desched_sig_blocked()))
-      << "syscallbuf is locked but SIGSYS isn't blocked";
-
   auto set = read_mem(setp);
 
   // Update the blocked signals per |how|.
@@ -1651,19 +1891,6 @@ void Task::update_sigmask(const Registers& regs) {
       break;
     default:
       FATAL() << "Unknown sigmask manipulator " << how;
-  }
-
-  // In the syscallbuf, we rely on SIGSYS being raised when
-  // tracees are descheduled in blocked syscalls.  But
-  // unfortunately, if tracees block SIGSYS, then we don't get
-  // notification of the pending signal and deadlock.  If we did
-  // get those notifications, this code would be unnecessary.
-  //
-  // So we lock the syscallbuf while the desched signal is
-  // blocked, which prevents the tracee from attempting a
-  // buffered call.
-  if (syscallbuf_hdr) {
-    syscallbuf_hdr->locked = is_desched_sig_blocked();
   }
 }
 
@@ -1710,37 +1937,37 @@ static bool is_signal_triggered_by_ptrace_interrupt(int sig) {
 
 // This function doesn't really need to do anything. The signal will cause
 // waitpid to return EINTR and that's all we need.
-static void handle_alarm_signal(int sig) {
+static void handle_alarm_signal(__attribute__((unused)) int sig) {
   LOG(debug) << "SIGALRM fired; maybe runaway tracee";
 }
 
 static const int ptrace_exit_wait_status = (PTRACE_EVENT_EXIT << 16) | 0x857f;
 
-void Task::wait(AllowInterrupt allow_interrupt) {
+static struct timeval to_timeval(double t) {
+  struct timeval v;
+  v.tv_sec = (time_t)floor(t);
+  v.tv_usec = (int)floor((t - v.tv_sec) * 1000000);
+  return v;
+}
+
+void Task::wait(double interrupt_after_elapsed) {
   LOG(debug) << "going into blocking waitpid(" << tid << ") ...";
   ASSERT(this, !unstable) << "Don't wait for unstable tasks";
+  ASSERT(this, session().is_recording() || interrupt_after_elapsed == 0);
 
-  // We only need this during recording.  If tracees go runaway
-  // during replay, something else is at fault.
-  bool enable_wait_interrupt = session().is_recording();
   int status;
-
   bool sent_wait_interrupt = false;
   pid_t ret;
   while (true) {
-    if (enable_wait_interrupt) {
-      // Where does the 3 seconds come from?  No especially
-      // good reason.  We want this to be pretty high,
-      // because it's a last-ditch recovery mechanism, not a
-      // primary thread scheduler.  Though in theory the
-      // PTRACE_INTERRUPT's shouldn't interfere with other
-      // events, that's hard to test thoroughly so try to
-      // avoid it.
-      alarm(3);
+    if (interrupt_after_elapsed) {
+      struct itimerval timer = { { 0, 0 },
+                                 to_timeval(interrupt_after_elapsed) };
+      setitimer(ITIMER_REAL, &timer, nullptr);
     }
     ret = waitpid(tid, &status, __WALL);
-    if (enable_wait_interrupt) {
-      alarm(0);
+    if (interrupt_after_elapsed) {
+      struct itimerval timer = { { 0, 0 }, { 0, 0 } };
+      setitimer(ITIMER_REAL, &timer, nullptr);
     }
     if (ret >= 0 || errno != EINTR) {
       // waitpid was not interrupted by the alarm.
@@ -1761,7 +1988,7 @@ void Task::wait(AllowInterrupt allow_interrupt) {
       break;
     }
 
-    if (!sent_wait_interrupt && allow_interrupt == ALLOW_INTERRUPT) {
+    if (!sent_wait_interrupt) {
       ptrace_if_alive(PTRACE_INTERRUPT, nullptr, nullptr);
       sent_wait_interrupt = true;
     }
@@ -1796,9 +2023,8 @@ void Task::wait(AllowInterrupt allow_interrupt) {
       PTRACE_EVENT_STOP == ptrace_event_from_status(status) &&
       is_signal_triggered_by_ptrace_interrupt(WSTOPSIG(status))) {
     LOG(warn) << "Forced to PTRACE_INTERRUPT tracee";
-    // Starve the runaway task of CPU time.  It just got
-    // the equivalent of hundreds of time slices.
-    succ_event_counter = numeric_limits<int>::max() / 2;
+    // Force this timeslice to end
+    record_session().scheduler().expire_timeslice();
     status = (PerfCounters::TIME_SLICE_SIGNAL << 8) | 0x7f;
     siginfo_t si;
     memset(&si, 0, sizeof(si));
@@ -1815,8 +2041,79 @@ void Task::wait(AllowInterrupt allow_interrupt) {
   did_waitpid(status);
 }
 
+static bool is_in_non_sigreturn_exit_syscall(Task* t) {
+  return t->stop_sig() == (SIGTRAP | 0x80) &&
+         (!t->ev().is_syscall_event() ||
+          !is_sigreturn(t->ev().Syscall().number, t->arch()));
+}
+
+/**
+ * Call this when we've trapped in a syscall (entry or exit) in the kernel,
+ * to normalize registers.
+ */
+static void fixup_syscall_registers(Registers& registers) {
+  if (registers.arch() == x86_64) {
+    // x86-64 'syscall' instruction copies RFLAGS to R11 on syscall entry.
+    // If we single-stepped into the syscall instruction, the TF flag will be
+    // set in R11. We don't want the value in R11 to depend on whether we
+    // were single-stepping during record or replay, possibly causing
+    // divergence.
+    // This doesn't matter when exiting a sigreturn syscall, since it
+    // restores the original flags.
+    // For untraced syscalls, the untraced-syscall entry point code (see
+    // write_rr_page) does this itself.
+    // We tried just clearing %r11, but that seemed to cause hangs in
+    // Ubuntu/Debian kernels for some unknown reason.
+    registers.set_r11(registers.r11() & ~X86_TF_FLAG);
+    // x86-64 'syscall' instruction copies return address to RCX on syscall
+    // entry. rr-related kernel activity normally sets RCX to -1 at some point
+    // during syscall execution, but apparently in some (unknown) situations
+    // probably involving untraced syscalls, that doesn't happen. To avoid
+    // potential issues, forcibly replace RCX with -1 always.
+    // This doesn't matter (and we should not do this) when exiting a
+    // sigreturn syscall, since it will restore the original RCX and we don't
+    // want to clobber that.
+    // For untraced syscalls, the untraced-syscall entry point code (see
+    // write_rr_page) does this itself.
+    registers.set_cx((intptr_t)-1);
+    // On kernel 3.13.0-68-generic #111-Ubuntu SMP we have observed a failed
+    // execve() clearing all flags during recording. During replay we emulate
+    // the exec so this wouldn't happen. Just reset all flags so everything's
+    // consistent.
+    // 0x246 is ZF+PF+IF+reserved, the result clearing a register using
+    // "xor reg, reg".
+    registers.set_flags(0x246);
+  } else if (registers.arch() == x86) {
+    // The x86 SYSENTER handling in Linux modifies EBP and EFLAGS on entry.
+    // EBP is the potential sixth syscall parameter, stored on the user stack.
+    // The EFLAGS changes are described here:
+    // http://linux-kernel.2935.n7.nabble.com/ia32-sysenter-target-does-not-preserve-EFLAGS-td1074164.html
+    // In a VMWare guest, the modifications to EFLAGS appear to be
+    // nondeterministic. Cover that up by setting EFLAGS to reasonable values
+    // now.
+    registers.set_flags(0x246);
+  }
+}
+
+void Task::emulate_syscall_entry(const Registers& regs) {
+  Registers r = regs;
+  if (r.arch() == x86_64) {
+    r.set_r11(r.flags());
+  }
+  fixup_syscall_registers(r);
+  set_regs(r);
+}
+
 void Task::did_waitpid(int status, siginfo_t* override_siginfo) {
+  Ticks more_ticks = hpc.read_ticks();
+  // Stop PerfCounters ASAP to reduce the possibility that due to bugs or
+  // whatever they pick up something spurious later.
+  hpc.stop();
+  ticks += more_ticks;
+  session().accumulate_ticks_processed(more_ticks);
+
   LOG(debug) << "  (refreshing register cache)";
+  intptr_t original_syscallno = registers.original_syscallno();
   // Skip reading registers immediately after a PTRACE_EVENT_EXEC, since
   // we may not know the correct architecture.
   if (ptrace_event() != PTRACE_EVENT_EXEC) {
@@ -1842,21 +2139,35 @@ void Task::did_waitpid(int status, siginfo_t* override_siginfo) {
   if (ptrace_event() == PTRACE_EVENT_EXIT) {
     seen_ptrace_exit_event = true;
   }
-  Ticks more_ticks = hpc.read_ticks();
-  ticks += more_ticks;
-  session().accumulate_ticks_processed(more_ticks);
 
-  if (registers.arch() == x86_64 &&
-      (syscall_stop() || is_in_untraced_syscall())) {
-    // x86-64 'syscall' instruction copies RFLAGS to R11 on syscall entry.
-    // If we single-stepped into the syscall instruction, the TF flag will be
-    // set in R11. We don't want the value in R11 to depend on whether we
-    // were single-stepping during record or replay, possibly causing
-    // divergence, so we clear it here before anything is recorded or checked.
-    registers.set_r11(registers.r11() & ~X86_TF_FLAG);
-    set_regs(registers);
+  bool need_to_set_regs = false;
+  if (registers.singlestep_flag()) {
+    registers.clear_singlestep_flag();
+    need_to_set_regs = true;
   }
-  if (registers.clear_singlestep_flag()) {
+
+  if (as->get_breakpoint_type_at_addr(address_of_last_execution_resume) !=
+          BKPT_NONE &&
+      pending_sig() == SIGTRAP && !ptrace_event()) {
+    ASSERT(this,
+           ip() ==
+               address_of_last_execution_resume.increment_by_bkpt_insn_length(
+                   arch()));
+    ASSERT(this, more_ticks == 0);
+    // When we resume execution and immediately hit a breakpoint, the original
+    // syscall number can be reset to -1. Undo that, so that the register
+    // state matches the state we'd be in if we hadn't resumed. ReplayTimeline
+    // depends on resume-at-a-breakpoint being a noop.
+    registers.set_original_syscallno(original_syscallno);
+    need_to_set_regs = true;
+  }
+
+  // When exiting a syscall, We need to normalize nondeterministic registers.
+  if (is_in_non_sigreturn_exit_syscall(this)) {
+    fixup_syscall_registers(registers);
+    need_to_set_regs = true;
+  }
+  if (need_to_set_regs) {
     set_regs(registers);
   }
 }
@@ -1875,6 +2186,23 @@ bool Task::try_wait() {
   return false;
 }
 
+bool Task::maybe_in_spinlock() {
+  return registers_at_start_of_uninterrupted_timeslice &&
+         regs().matches(*registers_at_start_of_uninterrupted_timeslice);
+}
+
+static void spawned_child_fatal_error(const char* format, ...) {
+  va_list args;
+  va_start(args, format);
+  char* buf;
+  vasprintf(&buf, format, args);
+
+  char* buf2;
+  asprintf(&buf2, "%s (%s)", buf, errno_name(errno).c_str());
+  write(-2, buf2, strlen(buf2));
+  exit(1);
+}
+
 /**
  * Prepare this process and its ancestors for recording/replay by
  * preventing direct access to sources of nondeterminism, and ensuring
@@ -1884,50 +2212,58 @@ static void set_up_process(Session& session) {
   /* TODO tracees can probably undo some of the setup below
    * ... */
 
+  /* CLOEXEC so that the original fd here will be closed by the exec that's
+   * about to happen.
+   */
   int fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
   if (0 > fd) {
-    FATAL() << "error opening /dev/null";
+    spawned_child_fatal_error("error opening /dev/null");
   }
   if (RR_MAGIC_SAVE_DATA_FD != dup2(fd, RR_MAGIC_SAVE_DATA_FD)) {
-    FATAL() << "error duping to RR_MAGIC_SAVE_DATA_FD";
+    spawned_child_fatal_error("error duping to RR_MAGIC_SAVE_DATA_FD");
+  }
+
+  /* CLOEXEC so that the original fd here will be closed by the exec that's
+   * about to happen.
+   */
+  fd = open("/", O_PATH | O_DIRECTORY | O_CLOEXEC);
+  if (0 > fd) {
+    spawned_child_fatal_error("error opening root directory");
+  }
+  if (RR_RESERVED_ROOT_DIR_FD != dup2(fd, RR_RESERVED_ROOT_DIR_FD)) {
+    spawned_child_fatal_error("error duping to RR_RESERVED_ROOT_DIR_FD");
   }
 
   if (session.is_replaying()) {
     // This task and all its descendants should silently reap any terminating
     // children.
     signal(SIGCHLD, SIG_IGN);
+
+    // If the rr process dies, prevent runaway tracee processes
+    // from dragging down the underlying system.
+    //
+    // TODO: this isn't inherited across fork().
+    if (0 > prctl(PR_SET_PDEATHSIG, SIGKILL)) {
+      spawned_child_fatal_error("Couldn't set parent-death signal");
+    }
+
+    // Put the replaying processes into their own session. This will stop
+    // signals being sent to these processes by the terminal --- in particular
+    // SIGTSTP/SIGINT/SIGWINCH.
+    setsid();
   }
 
-  /* Disable address space layout randomization, for obvious
-   * reasons, and ensure that the layout is otherwise well-known
-   * ("COMPAT").  For not-understood reasons, "COMPAT" layouts
-   * have been observed in certain recording situations but not
-   * in replay, which causes divergence. */
-  int orig_pers;
-  if (0 > (orig_pers = personality(0xffffffff))) {
-    FATAL() << "error getting personaity";
-  }
-  if (0 > personality(orig_pers | ADDR_NO_RANDOMIZE | ADDR_COMPAT_LAYOUT)) {
-    FATAL() << "error disabling randomization";
-  }
   /* Trap to the rr process if a 'rdtsc' instruction is issued.
    * That allows rr to record the tsc and replay it
    * deterministically. */
   if (0 > prctl(PR_SET_TSC, PR_TSC_SIGSEGV, 0, 0, 0)) {
-    FATAL() << "error setting up prctl";
-  }
-  // If the rr process dies, prevent runaway tracee processes
-  // from dragging down the underlying system.
-  //
-  // TODO: this isn't inherited across fork().
-  if (0 > prctl(PR_SET_PDEATHSIG, SIGKILL)) {
-    FATAL() << "Couldn't set parent-death signal";
+    spawned_child_fatal_error("error setting up prctl");
   }
 
   if (0 > prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
-    FATAL()
-        << "prctl(NO_NEW_PRIVS) failed, SECCOMP_FILTER is not available: your "
-           "kernel is too old. Use `record -n` to disable the filter.";
+    spawned_child_fatal_error(
+        "prctl(NO_NEW_PRIVS) failed, SECCOMP_FILTER is not available: your "
+        "kernel is too old. Use `record -n` to disable the filter.");
   }
 }
 
@@ -1942,13 +2278,26 @@ static void set_up_seccomp_filter(Session& session) {
 
   if (session.is_recording() && session.as_record()->use_syscall_buffer()) {
     uintptr_t in_untraced_syscall_ip =
-        AddressSpace::rr_page_ip_in_untraced_syscall().as_int();
+        AddressSpace::rr_page_ip_in_untraced_syscall().register_value();
+    uintptr_t in_untraced_replayed_syscall_ip =
+        AddressSpace::rr_page_ip_in_untraced_replayed_syscall()
+            .register_value();
+    uintptr_t privileged_in_untraced_syscall_ip =
+        AddressSpace::rr_page_ip_in_privileged_untraced_syscall()
+            .register_value();
     assert(in_untraced_syscall_ip == uint32_t(in_untraced_syscall_ip));
+    assert(in_untraced_replayed_syscall_ip ==
+           uint32_t(in_untraced_replayed_syscall_ip));
+    assert(privileged_in_untraced_syscall_ip ==
+           uint32_t(privileged_in_untraced_syscall_ip));
 
     struct sock_filter filter[] = {
-      /* Allow all system calls from our protected_call
-       * callsite */
+      /* Allow all system calls from our untraced_syscall callsite */
       ALLOW_SYSCALLS_FROM_CALLSITE(uint32_t(in_untraced_syscall_ip)),
+      /* Allow all system calls from our untraced_syscall callsite */
+      ALLOW_SYSCALLS_FROM_CALLSITE(uint32_t(in_untraced_replayed_syscall_ip)),
+      /* Allow all system calls from our privilged_untraced_syscall callsite */
+      ALLOW_SYSCALLS_FROM_CALLSITE(uint32_t(privileged_in_untraced_syscall_ip)),
       /* All the rest are handled in rr */
       TRACE_PROCESS,
     };
@@ -1959,19 +2308,19 @@ static void set_up_seccomp_filter(Session& session) {
     // dummy filter makes ptrace-event behavior consistent whether or not
     // we enable syscall buffering, and more importantly, consistent whether
     // or not the tracee installs its own seccomp filter.
-    struct sock_filter filter[] = { TRACE_PROCESS, };
+    struct sock_filter filter[] = {
+      TRACE_PROCESS,
+    };
     prog.len = (unsigned short)(sizeof(filter) / sizeof(filter[0]));
     prog.filter = filter;
   }
 
   /* Note: the filter is installed only for record. This call
    * will be emulated in the replay */
-  if (0 >
-      prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (uintptr_t) & prog, 0, 0)) {
-    if (session.is_recording() && session.as_record()->use_syscall_buffer()) {
-      FATAL() << "prctl(SECCOMP) failed, SECCOMP_FILTER is not available: your "
-                 "kernel is too old. Use `record -n` to disable the filter.";
-    }
+  if (0 > prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, (uintptr_t)&prog, 0, 0)) {
+    spawned_child_fatal_error(
+        "prctl(SECCOMP) failed, SECCOMP_FILTER is not available: your "
+        "kernel is too old.");
   }
   /* anything that happens from this point on gets filtered! */
 }
@@ -2006,11 +2355,15 @@ int Task::stop_sig_from_status(int status) const {
   return WSTOPSIG(status);
 }
 
-static TaskGroup::shr_ptr create_tg(Task* t, TaskGroup* parent) {
-  TaskGroup::shr_ptr tg(new TaskGroup(&t->session(), parent, t->rec_tid, t->tid,
-                                      t->tuid().serial()));
-  tg->insert_task(t);
-  return tg;
+template <typename Arch>
+static void set_thread_area_from_clone_arch(Task* t, remote_ptr<void> tls) {
+  if (Arch::clone_tls_type == Arch::UserDescPointer) {
+    t->set_thread_area(tls.cast<struct user_desc>());
+  }
+}
+
+static void set_thread_area_from_clone(Task* t, remote_ptr<void> tls) {
+  RR_ARCH_FUNCTION(set_thread_area_from_clone_arch, t->arch(), t, tls);
 }
 
 Task* Task::clone(int flags, remote_ptr<void> stack, remote_ptr<void> tls,
@@ -2021,41 +2374,51 @@ Task* Task::clone(int flags, remote_ptr<void> stack, remote_ptr<void> tls,
   Task* t = new Task(sess, new_tid, new_rec_tid, new_serial, priority, arch());
 
   t->blocked_sigs = blocked_sigs;
+  t->prctl_seccomp_status = prctl_seccomp_status;
   if (CLONE_SHARE_SIGHANDLERS & flags) {
     t->sighandlers = sighandlers;
   } else {
-    auto sh = Sighandlers::create();
+    auto sh = sighandlers->clone();
     t->sighandlers.swap(sh);
   }
   if (CLONE_SHARE_TASK_GROUP & flags) {
     t->tg = tg;
-    tg->insert_task(t);
   } else {
-    auto g = create_tg(t, tg.get());
-    t->tg.swap(g);
+    t->tg = sess.clone(t, tg);
   }
+  t->tg->insert_task(t);
   if (CLONE_SHARE_VM & flags) {
     t->as = as;
-    t->syscallbuf_fds_disabled_child = syscallbuf_fds_disabled_child;
-    // FdTable is either shared or copied, so we don't need to update
-    // syscallbuf_fds_disabled here.
+    if (!stack.is_null()) {
+      remote_ptr<void> last_stack_byte = stack - 1;
+      if (t->as->has_mapping(last_stack_byte)) {
+        auto mapping = t->as->mapping_of(last_stack_byte);
+        if (!mapping.recorded_map.is_heap()) {
+          const KernelMapping& m = mapping.map;
+          LOG(debug) << "mapping stack for " << new_tid << " at " << m;
+          t->as->map(m.start(), m.size(), m.prot(), m.flags(),
+                     m.file_offset_bytes(), "[stack]", m.device(), m.inode());
+        }
+      }
+    }
   } else {
     t->as = sess.clone(t, as);
   }
+  t->syscallbuf_fds_disabled_child = syscallbuf_fds_disabled_child;
+
+  t->stopping_breakpoint_table = stopping_breakpoint_table;
+  t->stopping_breakpoint_table_entry_size =
+      stopping_breakpoint_table_entry_size;
+
+  // FdTable is either shared or copied, so the contents of
+  // syscallbuf_fds_disabled_child are still valid.
   if (CLONE_SHARE_FILES & flags) {
     t->fds = fds;
+    t->fds->insert_task(t);
   } else {
     t->fds = fds->clone(t);
   }
-  if (!stack.is_null()) {
-    remote_ptr<void> last_stack_byte = stack - 1;
-    if (t->as->has_mapping(last_stack_byte)) {
-      const Mapping& m = t->as->mapping_of(last_stack_byte).first;
-      LOG(debug) << "mapping stack for " << new_tid << " at " << m;
-      t->as->map(m.start, m.num_bytes(), m.prot, m.flags, m.offset,
-                 MappableResource::stack(new_tid));
-    }
-  }
+
   t->top_of_stack = stack;
   // Clone children, both thread and fork, inherit the parent
   // prname.
@@ -2073,36 +2436,46 @@ Task* Task::clone(int flags, remote_ptr<void> stack, remote_ptr<void> tls,
   t->wait();
 
   t->open_mem_fd_if_needed();
+  t->thread_areas_ = thread_areas_;
   if (CLONE_SET_TLS & flags) {
-    t->set_thread_area(tls);
+    set_thread_area_from_clone(t, tls);
   }
 
   t->as->insert_task(t);
 
-  if (!(CLONE_SHARE_VM & flags) && !syscallbuf_child.is_null() &&
-      &session() == &t->session()) {
-    AutoRemoteSyscalls remote(t);
-    // Unshare the syscallbuf memory so when we lock it below, we don't
-    // also lock it in the task we cloned from!
-    int prot = PROT_READ | PROT_WRITE;
-    int flags = MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS;
-    auto p = remote.mmap_syscall(syscallbuf_child, num_syscallbuf_bytes, prot,
-                                 flags, -1, 0);
-    ASSERT(t, p == syscallbuf_child.cast<void>());
-    t->vm()->map(p, num_syscallbuf_bytes, prot, flags, 0,
-                 MappableResource::anonymous());
+  if (!(CLONE_SHARE_VM & flags) && &session() == &t->session()) {
+    as->did_fork_into(t);
 
-    // Mark the clone's syscallbuf as locked. This will prevent the
-    // clone using syscallbuf until the clone reinitializes the
-    // the buffer via its pthread_atfork handler. Otherwise the clone may
-    // log syscalls to its copy of the syscallbuf and we won't know about
-    // them since we don't have it mapped.
-    // In some cases (e.g. vfork(), or raw SYS_fork syscall) the
-    // pthread_atfork handler will never run. Syscallbuf will be permanently
-    // disabled but that's OK, those cases are rare (and in the case of vfork,
-    // tracees should immediately exit or exec anyway).
-    t->write_mem(REMOTE_PTR_FIELD(syscallbuf_child, locked), uint8_t(1));
+    if (!syscallbuf_child.is_null()) {
+      AutoRemoteSyscalls remote(t);
+      // Unshare the syscallbuf memory so when we lock it below, we don't
+      // also lock it in the task we cloned from!
+      int prot = PROT_READ | PROT_WRITE;
+      int flags = MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS;
+      remote.infallible_mmap_syscall(syscallbuf_child, num_syscallbuf_bytes,
+                                     prot, flags, -1, 0);
+      t->vm()->map(syscallbuf_child, num_syscallbuf_bytes, prot, flags, 0,
+                   string(), KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
+
+      // Mark the clone's syscallbuf as locked. This will prevent the
+      // clone using syscallbuf until the clone reinitializes the
+      // the buffer via its pthread_atfork handler. Otherwise the clone may
+      // log syscalls to its copy of the syscallbuf and we won't know about
+      // them since we don't have it mapped.
+      // In some cases (e.g. vfork(), or raw SYS_fork syscall) the
+      // pthread_atfork handler will never run. Syscallbuf will be permanently
+      // disabled but that's OK, those cases are rare (and in the case of vfork,
+      // tracees should immediately exit or exec anyway).
+      t->write_mem(REMOTE_PTR_FIELD(syscallbuf_child, locked), uint8_t(1));
+
+      if (CLONE_SHARE_FILES & flags) {
+        // Clear our desched_fd_child so that we don't try to close it.
+        // It should only be closed in |this|.
+        t->desched_fd_child = -1;
+      }
+    }
   }
+
   return t;
 }
 
@@ -2152,15 +2525,12 @@ template <typename Arch>
 static void copy_tls_arch(const Task::CapturedState& state,
                           AutoRemoteSyscalls& remote) {
   if (Arch::clone_tls_type == Arch::UserDescPointer) {
-    if (state.thread_area_valid) {
-      AutoRestoreMem remote_tls(remote, (const uint8_t*)&state.thread_area,
-                                sizeof(struct user_desc));
+    for (const struct user_desc& t : state.thread_areas) {
+      AutoRestoreMem remote_tls(remote, (const uint8_t*)&t, sizeof(t));
       LOG(debug) << "    setting tls " << remote_tls.get();
-      long err =
-          remote.syscall(syscall_number_for_set_thread_area(remote.arch()),
-                         remote_tls.get().as_int());
-      ASSERT(remote.task(), 0 == err);
-      remote.task()->set_thread_area(remote_tls.get());
+      remote.infallible_syscall(
+          syscall_number_for_set_thread_area(remote.arch()),
+          remote_tls.get().as_int());
     }
   }
 }
@@ -2179,13 +2549,19 @@ Task::CapturedState Task::capture_state() {
   state.prname = prname;
   state.robust_futex_list = robust_futex_list;
   state.robust_futex_list_len = robust_futex_list_len;
-  state.thread_area = thread_area;
-  state.thread_area_valid = thread_area_valid;
+  state.thread_areas = thread_areas_;
   state.num_syscallbuf_bytes = num_syscallbuf_bytes;
   state.desched_fd_child = desched_fd_child;
   state.syscallbuf_child = syscallbuf_child;
   if (syscallbuf_hdr) {
-    state.syscallbuf_hdr.resize(syscallbuf_data_size());
+    size_t data_size = syscallbuf_data_size();
+    if (syscallbuf_hdr->locked) {
+      // There may be an incomplete syscall record after num_rec_bytes that
+      // we need to capture here. We don't know how big that record is,
+      // so just record the entire buffer. This should not be common.
+      data_size = num_syscallbuf_bytes;
+    }
+    state.syscallbuf_hdr.resize(data_size);
     memcpy(state.syscallbuf_hdr.data(), syscallbuf_hdr,
            state.syscallbuf_hdr.size());
   }
@@ -2202,7 +2578,6 @@ Task::CapturedState Task::capture_state() {
 }
 
 void Task::copy_state(const CapturedState& state) {
-  long err;
   set_regs(state.regs);
   set_extra_regs(state.extra_regs);
   {
@@ -2213,29 +2588,19 @@ void Task::copy_state(const CapturedState& state) {
       AutoRestoreMem remote_prname(remote, (const uint8_t*)prname,
                                    sizeof(prname));
       LOG(debug) << "    setting name to " << prname;
-      err = remote.syscall(syscall_number_for_prctl(arch()), PR_SET_NAME,
-                           remote_prname.get().as_int());
-      ASSERT(this, 0 == err);
+      remote.infallible_syscall(syscall_number_for_prctl(arch()), PR_SET_NAME,
+                                remote_prname.get().as_int());
       update_prname(remote_prname.get());
     }
 
     if (!state.robust_futex_list.is_null()) {
       set_robust_list(state.robust_futex_list, state.robust_futex_list_len);
-      LOG(debug) << "    setting robust-list " << this->robust_list()
-                 << " (size " << this->robust_list_len() << ")";
-      err = remote.syscall(syscall_number_for_set_robust_list(arch()),
-                           this->robust_list(), this->robust_list_len());
-      ASSERT(this, 0 == err);
     }
 
     copy_tls(state, remote);
+    thread_areas_ = state.thread_areas;
 
-    auto ctid = state.tid_futex;
-    if (!ctid.is_null()) {
-      err = remote.syscall(syscall_number_for_set_tid_address(arch()), ctid);
-      ASSERT(this, tid == err);
-    }
-    tid_futex = ctid;
+    tid_futex = state.tid_futex;
 
     ASSERT(this, !syscallbuf_child)
         << "Syscallbuf should not already be initialized in clone";
@@ -2281,71 +2646,6 @@ void Task::destroy_local_buffers() {
   munmap(syscallbuf_hdr, num_syscallbuf_bytes);
 }
 
-void Task::detach_and_reap() {
-  // child_mem_fd needs to be valid since we won't be able to open
-  // it for futex_wait below after we've detached.
-  ASSERT(this, as->mem_fd().is_open());
-
-  if (unstable) {
-    fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
-    // In addition to problems described in the long
-    // comment at the prototype of this function, unstable
-    // exits may result in the kernel *not* clearing the
-    // futex, for example for fatal signals.  So we would
-    // deadlock waiting on the futex.
-    LOG(warn) << tid << " is unstable; not blocking on its termination";
-    // This will probably leak a zombie process for rr's lifetime.
-    return;
-  }
-
-  LOG(debug) << "Joining with exiting " << tid << " ...";
-  while (true) {
-    // Sometimes PTRACE_DETACH does not work until we've read
-    // the PTRACE_EXIT_EVENT. Use brute force; keep trying to
-    // detach over and over again.
-    fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
-    int err = waitpid(tid, &wait_status, __WALL);
-    if (-1 == err && ECHILD == errno) {
-      // child no longer exists for some reason. It's
-      // already reaped or maybe it's no longer our child.
-      // We may leak a zombie process.
-      // Note that during replay we'll often get this because cloned
-      // replay tasks are usually not our children --- but that's OK because
-      // our replay tasks all ignore SIGCHLD, causing the kernel to auto-reap
-      // their children.
-      LOG(debug) << " ... ECHILD";
-      break;
-    }
-    // Other errors such as EINTR should not happen here.
-    ASSERT(this, err == tid);
-    if (err == tid && (exited() || signaled())) {
-      LOG(debug) << " ... exited with status " << HEX(wait_status);
-      break;
-    }
-    assert(PTRACE_EVENT_EXIT == ptrace_event());
-    LOG(debug) << " ... PTRACE_EVENT_EXIT";
-    // and retry
-  }
-
-  if (!tid_futex.is_null() && as->task_set().size() > 0) {
-    // clone()'d tasks can have a pid_t* |ctid| argument
-    // that's written with the new task's pid.  That
-    // pointer can also be used as a futex: when the task
-    // dies, the original ctid value is cleared and a
-    // FUTEX_WAKE is done on the address. So
-    // pthread_join() is basically a standard futex wait
-    // loop.
-    LOG(debug) << "  waiting for tid futex " << tid_futex
-               << " to be cleared ...";
-    futex_wait(tid_futex, 0);
-  } else if (!tid_futex.is_null()) {
-    // There are no other live tasks in this address
-    // space, which means the address space just died
-    // along with our exit.  So we can't read the futex.
-    LOG(debug) << "  (can't futex_wait last task in vm)";
-  }
-}
-
 long Task::fallible_ptrace(int request, remote_ptr<void> addr, void* data) {
   return ptrace(__ptrace_request(request), tid, addr, data);
 }
@@ -2363,16 +2663,16 @@ void Task::open_mem_fd() {
   long remote_fd;
   {
     AutoRestoreMem remote_path(remote, (const uint8_t*)path, sizeof(path));
-    remote_fd = remote.syscall(syscall_number_for_open(arch()),
-                               remote_path.get().as_int(), O_RDWR);
-    assert(remote_fd >= 0);
+    // skip leading '/' since we want the path to be relative to the root fd
+    remote_fd = remote.infallible_syscall(syscall_number_for_openat(arch()),
+                                          RR_RESERVED_ROOT_DIR_FD,
+                                          remote_path.get() + 1, O_RDWR);
   }
 
   as->set_mem_fd(remote.retrieve_fd(remote_fd));
-  assert(as->mem_fd().is_open());
+  ASSERT(this, as->mem_fd().is_open());
 
-  long err = remote.syscall(syscall_number_for_close(arch()), remote_fd);
-  assert(!err);
+  remote.infallible_syscall(syscall_number_for_close(arch()), remote_fd);
 }
 
 void Task::open_mem_fd_if_needed() {
@@ -2383,24 +2683,32 @@ void Task::open_mem_fd_if_needed() {
 
 void Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
                                remote_ptr<void> map_hint) {
+  static int nonce = 0;
   // Create the segment we'll share with the tracee.
-  char shmem_name[PATH_MAX];
-  format_syscallbuf_shmem_path(tid, shmem_name);
-  ScopedFd shmem_fd = create_shmem_segment(shmem_name, SYSCALLBUF_BUFFER_SIZE);
-  // Map the shmem fd in the child.
+  char path[PATH_MAX];
+  snprintf(path, sizeof(path) - 1, SYSCALLBUF_SHMEM_PATH_PREFIX "%d-%d", tid,
+           nonce++);
+
+  // Let the child create the shmem block and then send the fd back to us.
+  // This lets us avoid having to make the file world-writeable so that
+  // the child can read it when it's in a different user namespace (which
+  // would be a security hole, letting other users abuse rr users).
   int child_shmem_fd;
   {
-    char proc_path[PATH_MAX];
-    snprintf(proc_path, sizeof(proc_path), "/proc/%d/fd/%d", getpid(),
-             shmem_fd.get());
-    AutoRestoreMem child_path(remote, proc_path);
-    child_shmem_fd = remote.syscall(syscall_number_for_open(arch()),
-                                    child_path.get().as_int(), O_RDWR, 0600);
-    if (0 > child_shmem_fd) {
-      errno = -child_shmem_fd;
-      FATAL() << "Failed to open(" << proc_path << ") in tracee";
-    }
+    AutoRestoreMem child_path(remote, path);
+    // skip leading '/' since we want the path to be relative to the root fd
+    child_shmem_fd = remote.infallible_syscall(
+        syscall_number_for_openat(arch()), RR_RESERVED_ROOT_DIR_FD,
+        child_path.get() + 1, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
   }
+
+  /* Remove the fs name so that we don't have to worry about
+   * cleaning up this segment in error conditions. */
+  unlink(path);
+
+  ScopedFd shmem_fd = remote.retrieve_fd(child_shmem_fd);
+  resize_shmem_segment(shmem_fd, SYSCALLBUF_BUFFER_SIZE);
+  LOG(debug) << "created shmem segment " << path;
 
   // Map the segment in ours and the tracee's address spaces.
   void* map_addr;
@@ -2414,13 +2722,8 @@ void Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
   if (!map_hint.is_null()) {
     flags |= MAP_FIXED;
   }
-  remote_ptr<void> child_map_addr = remote.mmap_syscall(
+  remote_ptr<void> child_map_addr = remote.infallible_mmap_syscall(
       map_hint, num_syscallbuf_bytes, prot, flags, child_shmem_fd, 0);
-  if (!map_hint.is_null()) {
-    ASSERT(this, child_map_addr == map_hint)
-        << "Tried to map syscallbuf at " << HEX(map_hint.as_int())
-        << " but got " << HEX(child_map_addr.as_int());
-  }
 
   ASSERT(this, !syscallbuf_child)
       << "Should not already have syscallbuf initialized!";
@@ -2429,50 +2732,23 @@ void Task::init_syscall_buffer(AutoRemoteSyscalls& remote,
   // No entries to begin with.
   memset(syscallbuf_hdr, 0, sizeof(*syscallbuf_hdr));
 
-  vm()->map(child_map_addr, num_syscallbuf_bytes, prot, flags, 0,
-            MappableResource::syscallbuf(rec_tid, shmem_fd, shmem_name));
+  struct stat st;
+  ASSERT(this, 0 == ::fstat(shmem_fd, &st));
+  vm()->map(child_map_addr, num_syscallbuf_bytes, prot, flags, 0, path,
+            st.st_dev, st.st_ino);
 
   shmem_fd.close();
-  remote.syscall(syscall_number_for_close(arch()), child_shmem_fd);
+  remote.infallible_syscall(syscall_number_for_close(arch()), child_shmem_fd);
 }
 
-bool Task::is_desched_sig_blocked() {
-  return is_sig_blocked(SYSCALLBUF_DESCHED_SIGNAL);
+void Task::tgkill(int sig) {
+  ASSERT(this, 0 == syscall(SYS_tgkill, real_tgid(), tid, sig));
 }
 
-void Task::tgkill(int sig) { syscall(SYS_tgkill, real_tgid(), tid, sig); }
-
-void Task::prepare_kill() {
-  if (!stable_exit) {
-    LOG(debug) << "safely detaching from " << tid << " ...";
-    // Detaching from the process lets it continue. We don't want a replaying
-    // process to perform syscalls or do anything else observable before we
-    // get around to SIGKILLing it. So we move its ip() to an invalid
-    // address. If it does continue, it will probably get a fatal signal.
-    // We don't install real signal handlers in replayed processes so there's
-    // no way it could handle the signal and continue.
-    Registers r = regs();
-    r.set_ip(intptr_t(-1));
-    set_regs(r);
-    long result;
-    do {
-      // We have observed this failing with an ESRCH when the thread clearly
-      // still exists and is ptraced. Retrying the PTRACE_DETACH seems to
-      // work around it.
-      result = fallible_ptrace(PTRACE_DETACH, nullptr, nullptr);
-      ASSERT(this, result >= 0 || errno == ESRCH);
-    } while (result < 0);
-  }
-}
-
-void Task::kill() {
-  if (!stable_exit) {
-    LOG(debug) << "sending SIGKILL to " << tid << " ...";
-    // If we haven't already done a stable exit via syscall,
-    // kill the task and note that the entire task group is unstable.
-    tgkill(SIGKILL);
-    tg->destabilize();
-  }
+void Task::reset_syscallbuf() {
+  uint8_t* ptr = (uint8_t*)(syscallbuf_hdr + 1);
+  memset(ptr, 0, syscallbuf_hdr->num_rec_bytes);
+  syscallbuf_hdr->num_rec_bytes = 0;
 }
 
 void Task::maybe_flush_syscallbuf() {
@@ -2480,34 +2756,45 @@ void Task::maybe_flush_syscallbuf() {
     // Already flushing.
     return;
   }
-  // This can be called while the task is not stopped, when we prematurely
-  // terminate the trace. In that case, we should avoid reading header data
-  // that the task could be concurrently modifying. We could still race on
-  // the actual syscallbuf data, but there's nothing we can do about that and
-  // it could only affect replay of the very last syscall before termination.
-  if (!syscallbuf_hdr || (is_stopped && 0 == syscallbuf_hdr->num_rec_bytes) ||
-      delay_syscallbuf_flush) {
-    // No syscallbuf or no records.  No flushing to do.
+  if (!syscallbuf_hdr) {
     return;
   }
+
+  // This can be called while the task is not stopped, when we prematurely
+  // terminate the trace. In that case, the tracee could be concurrently
+  // modifying the header. We'll take a snapshot of the header now.
+  // The syscallbuf code ensures that writes to syscallbuf records
+  // complete before num_rec_bytes is incremented.
+  struct syscallbuf_hdr hdr = *syscallbuf_hdr;
+
+  ASSERT(this,
+         !flushed_syscallbuf || flushed_num_rec_bytes == hdr.num_rec_bytes);
+
+  if (!hdr.num_rec_bytes || flushed_syscallbuf) {
+    // no records, or we've already flushed.
+    return;
+  }
+
   // Write the entire buffer in one shot without parsing it,
   // because replay will take care of that.
   push_event(Event(EV_SYSCALLBUF_FLUSH, NO_EXEC_INFO, arch()));
-  record_local(syscallbuf_child,
-               // Record the header for consistency checking.
-               is_stopped ? syscallbuf_data_size() : num_syscallbuf_bytes,
-               syscallbuf_hdr);
+  if (is_stopped) {
+    record_local(syscallbuf_child, syscallbuf_data_size(), syscallbuf_hdr);
+  } else {
+    vector<uint8_t> buf;
+    buf.resize(sizeof(hdr) + hdr.num_rec_bytes);
+    memcpy(buf.data(), &hdr, sizeof(hdr));
+    memcpy(buf.data() + sizeof(hdr), syscallbuf_hdr + 1, hdr.num_rec_bytes);
+    record_local(syscallbuf_child, buf.size(), buf.data());
+  }
   record_current_event();
   pop_event(EV_SYSCALLBUF_FLUSH);
 
-  if (is_stopped) {
-    // Reset header.
-    assert(!syscallbuf_hdr->abort_commit);
-    if (!delay_syscallbuf_reset) {
-      syscallbuf_hdr->num_rec_bytes = 0;
-    }
-  }
   flushed_syscallbuf = true;
+  flushed_num_rec_bytes = hdr.num_rec_bytes;
+
+  LOG(debug) << "Syscallbuf flushed with num_rec_bytes="
+             << (uint32_t)hdr.num_rec_bytes;
 }
 
 ssize_t Task::read_bytes_ptrace(remote_ptr<void> addr, ssize_t buf_size,
@@ -2580,28 +2867,50 @@ ssize_t Task::read_bytes_fallible(remote_ptr<void> addr, ssize_t buf_size,
     return read_bytes_ptrace(addr, buf_size, buf);
   }
 
-  errno = 0;
-  ssize_t nread = pread64(as->mem_fd(), buf, buf_size, addr.as_int());
-  // We open the mem_fd just after being notified of
-  // exec(), when the Task is created.  Trying to read from that
-  // fd seems to return 0 with errno 0.  Reopening the mem fd
-  // allows the pwrite to succeed.  It seems that the first mem
-  // fd we open, very early in exec, refers to some resource
-  // that's different than the one we see after reopening the
-  // fd, after exec.
-  if (0 == nread && 0 == errno) {
-    open_mem_fd();
-    return read_bytes_fallible(addr, buf_size, buf);
+  ssize_t all_read = 0;
+  while (all_read < buf_size) {
+    errno = 0;
+    ssize_t nread = pread64(as->mem_fd(), static_cast<uint8_t*>(buf) + all_read,
+                            buf_size - all_read, addr.as_int() + all_read);
+    // We open the mem_fd just after being notified of
+    // exec(), when the Task is created.  Trying to read from that
+    // fd seems to return 0 with errno 0.  Reopening the mem fd
+    // allows the pwrite to succeed.  It seems that the first mem
+    // fd we open, very early in exec, refers to some resource
+    // that's different than the one we see after reopening the
+    // fd, after exec.
+    if (0 == nread && 0 == all_read && 0 == errno) {
+      open_mem_fd();
+      continue;
+    }
+    if (nread <= 0) {
+      if (all_read > 0) {
+        // We did successfully read some data, so return success and ignore
+        // any error.
+        errno = 0;
+        return all_read;
+      }
+      return nread;
+    }
+    // We read some data. We should try again in case we get short reads.
+    all_read += nread;
   }
-  return nread;
+  return all_read;
 }
 
-void Task::read_bytes_helper(remote_ptr<void> addr, ssize_t buf_size,
-                             void* buf) {
+void Task::read_bytes_helper(remote_ptr<void> addr, ssize_t buf_size, void* buf,
+                             bool* ok) {
+  // pread64 etc can't handle addresses that appear to be negative ...
+  // like [vsyscall].
   ssize_t nread = read_bytes_fallible(addr, buf_size, buf);
-  ASSERT(this, nread == buf_size) << "Should have read " << buf_size
-                                  << " bytes from " << addr
-                                  << ", but only read " << nread;
+  if (nread != buf_size) {
+    if (ok) {
+      *ok = false;
+    } else {
+      ASSERT(this, false) << "Should have read " << buf_size << " bytes from "
+                          << addr << ", but only read " << nread;
+    }
+  }
 }
 
 bool Task::try_replace_pages(remote_ptr<void> addr, ssize_t buf_size,
@@ -2614,14 +2923,14 @@ bool Task::try_replace_pages(remote_ptr<void> addr, ssize_t buf_size,
       (addr.as_int() + buf_size + page_size - 1) & ~(page_size - 1);
   int all_prot, all_flags;
   for (uintptr_t p = page_start; p < page_end; p += page_size) {
-    const Mapping& m = as->mapping_of(p).first;
+    const KernelMapping& m = as->mapping_of(p).map;
     if (p > page_start) {
-      if (all_prot != m.prot || all_flags != m.flags) {
+      if (all_prot != m.prot() || all_flags != m.flags()) {
         return false;
       }
     } else {
-      all_prot = m.prot;
-      all_flags = m.flags;
+      all_prot = m.prot();
+      all_flags = m.flags();
     }
   }
   if (!(all_flags & MAP_PRIVATE)) {
@@ -2643,23 +2952,60 @@ bool Task::try_replace_pages(remote_ptr<void> addr, ssize_t buf_size,
   SupportedArch a = arch();
   AutoRestoreMem child_path(remote, reinterpret_cast<uint8_t*>(path),
                             sizeof(path));
-  int child_fd =
-      remote.syscall(syscall_number_for_open(a), child_path.get(), O_RDWR);
+  // skip leading '/' since we want the path to be relative to the root fd
+  int child_fd = remote.infallible_syscall(syscall_number_for_openat(a),
+                                           RR_RESERVED_ROOT_DIR_FD,
+                                           child_path.get() + 1, O_RDWR);
   ASSERT(this, child_fd >= 0);
 
   // Just map the new file right over the top of existing pages
-  auto result = remote.mmap_syscall(page_start, cur.size(), all_prot,
-                                    all_flags | MAP_FIXED, child_fd, 0);
-  ASSERT(this, result.as_int() == page_start);
+  remote.infallible_mmap_syscall(page_start, cur.size(), all_prot,
+                                 all_flags | MAP_FIXED, child_fd, 0);
 
-  remote.syscall(syscall_number_for_close(a), child_fd);
+  remote.infallible_syscall(syscall_number_for_close(a), child_fd);
 
   unlink(path);
   return true;
 }
 
+/**
+ * This function exists to work around
+ * https://bugzilla.kernel.org/show_bug.cgi?id=99101.
+ * On some kernels pwrite() to /proc/.../mem fails when writing to a region
+ * that's PROT_NONE.
+ */
+static ssize_t safe_pwrite64(Task* t, const void* buf, ssize_t buf_size,
+                             remote_ptr<void> addr) {
+  vector<KernelMapping> mappings_to_fix;
+  for (auto m : t->vm()->maps_starting_at(floor_page_size(addr))) {
+    if (m.map.start() >= ceil_page_size(addr + buf_size)) {
+      break;
+    }
+    if (!(m.map.prot() & (PROT_READ | PROT_WRITE))) {
+      mappings_to_fix.push_back(m.map);
+    }
+  };
+
+  if (mappings_to_fix.empty()) {
+    return pwrite64(t->vm()->mem_fd(), buf, buf_size, addr.as_int());
+  }
+
+  AutoRemoteSyscalls remote(t);
+  int mprotect_syscallno = syscall_number_for_mprotect(t->arch());
+  for (auto& m : mappings_to_fix) {
+    remote.infallible_syscall(mprotect_syscallno, m.start(), m.size(),
+                              m.prot() | PROT_WRITE);
+  }
+  ssize_t nwritten = pwrite64(t->vm()->mem_fd(), buf, buf_size, addr.as_int());
+  for (auto& m : mappings_to_fix) {
+    remote.infallible_syscall(mprotect_syscallno, m.start(), m.size(),
+                              m.prot());
+  }
+  return nwritten;
+}
+
 void Task::write_bytes_helper(remote_ptr<void> addr, ssize_t buf_size,
-                              const void* buf) {
+                              const void* buf, bool* ok) {
   ASSERT(this, buf_size >= 0) << "Invalid buf_size " << buf_size;
   if (0 == buf_size) {
     return;
@@ -2667,26 +3013,39 @@ void Task::write_bytes_helper(remote_ptr<void> addr, ssize_t buf_size,
 
   if (!as->mem_fd().is_open()) {
     ssize_t nwritten = write_bytes_ptrace(addr, buf_size, buf);
-    vm()->notify_written(addr, nwritten);
+    if (nwritten > 0) {
+      vm()->notify_written(addr, nwritten);
+    }
+    if (ok && nwritten < buf_size) {
+      *ok = false;
+    }
     return;
   }
 
   errno = 0;
-  ssize_t nwritten = pwrite64(as->mem_fd(), buf, buf_size, addr.as_int());
+  ssize_t nwritten = safe_pwrite64(this, buf, buf_size, addr.as_int());
   // See comment in read_bytes_helper().
   if (0 == nwritten && 0 == errno) {
     open_mem_fd();
-    return write_bytes_helper(addr, buf_size, buf);
+    return write_bytes_helper(addr, buf_size, buf, ok);
   }
   if (errno == EPERM && try_replace_pages(addr, buf_size, buf)) {
     // Maybe a PaX kernel and we're trying to write to an executable page.
     vm()->notify_written(addr, buf_size);
     return;
   }
-  ASSERT(this, nwritten == buf_size) << "Should have written " << buf_size
-                                     << " bytes to " << addr
-                                     << ", but only wrote " << nwritten;
-  vm()->notify_written(addr, nwritten);
+  if (ok) {
+    if (nwritten < buf_size) {
+      *ok = false;
+    }
+  } else {
+    ASSERT(this, nwritten == buf_size) << "Should have written " << buf_size
+                                       << " bytes to " << addr
+                                       << ", but only wrote " << nwritten;
+  }
+  if (nwritten > 0) {
+    vm()->notify_written(addr, nwritten);
+  }
 }
 
 const TraceStream* Task::trace_stream() const {
@@ -2731,29 +3090,41 @@ bool Task::clone_syscall_is_complete() {
   // handle this.
   // XXX ENOSYS shouldn't happen here.
   intptr_t result = regs().syscall_result_signed();
-  ASSERT(this,
-         regs().syscall_may_restart() || -ENOSYS == result || -EAGAIN == result)
-      << "Unexpected task status " << HEX(status())
-      << " (syscall result:" << regs().syscall_result_signed() << ")";
+  ASSERT(this, regs().syscall_may_restart() || -ENOSYS == result ||
+                   -EAGAIN == result || -ENOMEM == result)
+      << "Unexpected task status " << HEX(status()) << " ("
+      << syscall_name(regs().original_syscallno())
+      << " syscall errno: " << errno_name(-result) << ")";
   return false;
 }
 
-template <typename Arch>
-static remote_ptr<char> get_syscallbuf_fds_disabled_arch(Task* t) {
+template <typename Arch> static void do_preload_init_arch(Task* t) {
   auto params = t->read_mem(
       remote_ptr<rrcall_init_preload_params<Arch> >(t->regs().arg1()));
+
   remote_ptr<volatile char> syscallbuf_fds_disabled =
-      params.syscallbuf_fds_disabled;
-  return syscallbuf_fds_disabled.cast<char>();
+      params.syscallbuf_fds_disabled.rptr();
+  t->syscallbuf_fds_disabled_child = syscallbuf_fds_disabled.cast<char>();
+
+  t->stopping_breakpoint_table = params.breakpoint_table.rptr().as_int();
+  t->stopping_breakpoint_table_entry_size = params.breakpoint_table_entry_size;
+
+  t->write_mem(params.in_replay_flag.rptr(),
+               (unsigned char)t->session().is_replaying());
+  if (t->session().is_recording()) {
+    int cores = t->record_session().scheduler().pretend_num_cores();
+    t->write_mem(params.pretend_num_cores.rptr(), cores);
+    t->record_local(params.pretend_num_cores.rptr(), &cores);
+  }
 }
 
-static remote_ptr<char> get_syscallbuf_fds_disabled(Task* t) {
-  RR_ARCH_FUNCTION(get_syscallbuf_fds_disabled_arch, t->arch(), t);
+static void do_preload_init(Task* t) {
+  RR_ARCH_FUNCTION(do_preload_init_arch, t->arch(), t);
 }
 
 void Task::at_preload_init() {
-  vm()->at_preload_init(this);
-  syscallbuf_fds_disabled_child = get_syscallbuf_fds_disabled(this);
+  do_preload_init(this);
+
   fd_table()->init_syscallbuf_fds_disabled(this);
 }
 
@@ -2794,16 +3165,12 @@ static void perform_remote_clone(Task* parent, AutoRemoteSyscalls& remote,
       perform_remote_clone(parent, remote, base_flags, stack, ptid, tls, ctid);
     } else {
       // XXX account for ReplaySession::is_ignored_signal?
-      parent->cont_syscall();
+      parent->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
     }
   }
+  pid_t new_tid = parent->get_ptrace_eventmsg_pid();
 
-  parent->cont_syscall();
-  long new_tid = parent->regs().syscall_result_signed();
-  if (0 > new_tid) {
-    FATAL() << "Failed to clone(" << parent->tid << ") -> " << new_tid << ": "
-            << strerror(-new_tid);
-  }
+  parent->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_NO_TICKS);
   Task* child =
       parent->clone(clone_flags_to_task_flags(base_flags), stack, tls, ctid,
                     new_tid, rec_child_tid, new_serial, session);
@@ -2814,6 +3181,18 @@ static void setup_fd_table(FdTable& fds) {
   fds.add_monitor(STDOUT_FILENO, new StdioMonitor(STDOUT_FILENO));
   fds.add_monitor(STDERR_FILENO, new StdioMonitor(STDERR_FILENO));
   fds.add_monitor(RR_MAGIC_SAVE_DATA_FD, new MagicSaveDataMonitor());
+  fds.add_monitor(RR_RESERVED_ROOT_DIR_FD, new PreserveFileMonitor());
+}
+
+static void set_cpu_affinity(int cpu) {
+  assert(cpu >= 0);
+
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  CPU_SET(cpu, &mask);
+  if (0 > sched_setaffinity(0, sizeof(mask), &mask)) {
+    FATAL() << "Couldn't bind to CPU " << cpu;
+  }
 }
 
 /*static*/ Task* Task::spawn(Session& session, const TraceStream& trace,
@@ -2857,7 +3236,7 @@ static void setup_fd_table(FdTable& fds) {
     // non-zero.  The tracer can then check the ticks value
     // at the first ptrace-trap to see if it seems to be
     // working.
-    int start = rand() % 5;
+    int start = random() % 5;
     int num_its = start + 5;
     int sum = 0;
     for (int i = start; i < num_its; ++i) {
@@ -2867,10 +3246,24 @@ static void setup_fd_table(FdTable& fds) {
 
     CPUIDBugDetector::run_detection_code();
 
-    execvpe(trace.initial_exe().c_str(),
+    const char* exe = trace.initial_exe().c_str();
+    execvpe(exe,
             StringVectorToCharArray(trace.initial_argv()).get(),
             StringVectorToCharArray(trace.initial_envp()).get());
-    FATAL() << "Failed to exec '" << trace.initial_exe().c_str() << "'";
+    // That failed. Try executing the file directly.
+    execve(exe,
+           StringVectorToCharArray(trace.initial_argv()).get(),
+           StringVectorToCharArray(trace.initial_envp()).get());
+
+    switch (errno) {
+      case ENOENT:
+        spawned_child_fatal_error(
+            "execve failed: '%s' (or interpreter) not found", exe);
+        break;
+      default:
+        spawned_child_fatal_error("execve of '%s' failed", exe);
+        break;
+    }
   }
 
   if (0 > tid) {
@@ -2882,6 +3275,30 @@ static void setup_fd_table(FdTable& fds) {
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = 0; // No SA_RESTART, so waitpid() will be interrupted
   sigaction(SIGALRM, &sa, nullptr);
+
+  // Sync with the child process.
+  // We minimize the code we run between fork()ing and PTRACE_SEIZE, because
+  // any abnormal exit of the rr process will leave the child paused and
+  // parented by the init process, i.e. effectively leaked. After PTRACE_SEIZE
+  // with PTRACE_O_EXITKILL, the tracee will die if rr dies.
+  intptr_t options =
+      PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK |
+      PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEVFORKDONE |
+      PTRACE_O_TRACEEXIT | PTRACE_O_EXITKILL | PTRACE_O_TRACESECCOMP;
+  long ret = ptrace(PTRACE_SEIZE, tid, nullptr, (void*)options);
+  if (ret < 0 && errno == EINVAL) {
+    // PTRACE_O_EXITKILL was added in kernel 3.8, and we only need
+    // it for more robust cleanup, so tolerate not having it.
+    options &= ~PTRACE_O_EXITKILL;
+    ret = ptrace(PTRACE_SEIZE, tid, nullptr, (void*)options);
+  }
+  if (ret) {
+    // Note that although the tracee may have died due to some fatal error,
+    // we haven't reaped its exit code so there's no danger of killing
+    // (or PTRACE_SEIZEing) the wrong process.
+    kill(tid, SIGKILL);
+    FATAL() << "PTRACE_SEIZE failed for tid " << tid;
+  }
 
   Task* t = new Task(session, tid, rec_tid, session.next_task_serial(), 0,
                      NativeArch::arch());
@@ -2898,31 +3315,12 @@ static void setup_fd_table(FdTable& fds) {
                 sizeof(t->blocked_sigs))) {
     FATAL() << "Failed to read blocked signals";
   }
-  auto g = create_tg(t, nullptr);
-  t->tg.swap(g);
+  auto tg = session.create_tg(t);
+  t->tg.swap(tg);
   auto as = session.create_vm(t, trace.initial_exe());
   t->as.swap(as);
   t->fds = FdTable::create(t);
   setup_fd_table(*t->fds);
-
-  // Sync with the child process.
-  intptr_t options = PTRACE_O_TRACESYSGOOD | PTRACE_O_TRACEFORK |
-                     PTRACE_O_TRACEVFORK | PTRACE_O_TRACECLONE |
-                     PTRACE_O_TRACEEXEC | PTRACE_O_TRACEVFORKDONE |
-                     PTRACE_O_TRACEEXIT | PTRACE_O_EXITKILL;
-
-  if (session.is_recording()) {
-    options |= PTRACE_O_TRACESECCOMP;
-  }
-
-  long ret = t->fallible_ptrace(PTRACE_SEIZE, nullptr, (void*)options);
-  if (ret < 0 && errno == EINVAL) {
-    // PTRACE_O_EXITKILL was added in kernel 3.8, and we only need
-    // it for more robust cleanup, so tolerate not having it.
-    options &= ~PTRACE_O_EXITKILL;
-    ret = t->fallible_ptrace(PTRACE_SEIZE, nullptr, (void*)options);
-  }
-  ASSERT(t, !ret) << "PTRACE_SEIZE failed for tid " << t->tid;
 
   // PTRACE_SEIZE is fundamentally racy by design.  We depend on
   // stopping the tracee at a known location, so raciness is
@@ -2932,11 +3330,12 @@ static void setup_fd_table(FdTable& fds) {
   // Alternatively, it would be possible to remove the
   // requirement of the tracing beginning from a known point.
   while (true) {
-    t->wait(DONT_ALLOW_INTERRUPT);
+    t->wait();
     if (SIGSTOP == t->stop_sig()) {
       break;
     }
-    t->cont_nonblocking();
+    t->resume_execution(RESUME_CONT, RESUME_NONBLOCKING,
+                        RESUME_UNLIMITED_TICKS);
   }
   t->wait_status = 0;
   t->open_mem_fd();
@@ -2945,4 +3344,86 @@ static void setup_fd_table(FdTable& fds) {
 
 string Task::syscall_name(int syscall) const {
   return ::syscall_name(syscall, arch());
+}
+
+pid_t Task::find_newborn_thread() {
+  ASSERT(this, session().is_recording());
+  ASSERT(this, ptrace_event() == PTRACE_EVENT_CLONE);
+
+  pid_t hint = get_ptrace_eventmsg_pid();
+  char path[PATH_MAX];
+  sprintf(path, "/proc/%d/task/%d", tid, hint);
+  struct stat stat_buf;
+  // This should always succeed, but may fail in old kernels due to
+  // a kernel bug. See RecordSession::handle_ptrace_event.
+  if (!session().find_task(hint) && 0 == stat(path, &stat_buf)) {
+    return hint;
+  }
+
+  sprintf(path, "/proc/%d/task", tid);
+  DIR* dir = opendir(path);
+  ASSERT(this, dir);
+  while (true) {
+    struct dirent* result;
+    struct dirent entry;
+    int ret = readdir_r(dir, &entry, &result);
+    ASSERT(this, !ret && result == &entry);
+    char* end;
+    pid_t thread_tid = strtol(entry.d_name, &end, 10);
+    if (*end == '\0' && !session().find_task(thread_tid)) {
+      closedir(dir);
+      return thread_tid;
+    }
+  }
+}
+
+static bool is_ppid_of(pid_t ppid, pid_t pid) {
+  char path[PATH_MAX];
+  sprintf(path, "/proc/%d/status", pid);
+  FILE* status = fopen(path, "r");
+  if (!status) {
+    return false;
+  }
+  while (true) {
+    char line[1024];
+    if (!fgets(line, sizeof(line), status)) {
+      fclose(status);
+      return false;
+    }
+    if (strncmp(line, "PPid:", 5) == 0) {
+      fclose(status);
+      char* end;
+      int actual_ppid = strtol(line + 5, &end, 10);
+      return *end == '\n' && actual_ppid == ppid;
+    }
+  }
+}
+
+pid_t Task::find_newborn_child_process() {
+  ASSERT(this, session().is_recording());
+  ASSERT(this, ptrace_event() == PTRACE_EVENT_CLONE ||
+                   ptrace_event() == PTRACE_EVENT_FORK);
+
+  pid_t hint = get_ptrace_eventmsg_pid();
+  // This should always succeed, but may fail in old kernels due to
+  // a kernel bug. See RecordSession::handle_ptrace_event.
+  if (!session().find_task(hint) && is_ppid_of(real_tgid(), hint)) {
+    return hint;
+  }
+
+  DIR* dir = opendir("/proc");
+  ASSERT(this, dir);
+  while (true) {
+    struct dirent* result;
+    struct dirent entry;
+    int ret = readdir_r(dir, &entry, &result);
+    ASSERT(this, !ret && result == &entry);
+    char* end;
+    pid_t proc_tid = strtol(entry.d_name, &end, 10);
+    if (*end == '\0' && !session().find_task(proc_tid) &&
+        is_ppid_of(real_tgid(), proc_tid)) {
+      closedir(dir);
+      return proc_tid;
+    }
+  }
 }

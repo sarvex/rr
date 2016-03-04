@@ -13,59 +13,13 @@
 struct syscallbuf_hdr;
 
 /**
- * The state of a (dis)arm-desched-event ioctl that's being processed.
- */
-enum ReplayDeschedType {
-  DESCHED_ARM,
-  DESCHED_DISARM
-};
-enum ReplayDeschedEnterExit {
-  DESCHED_ENTER,
-  DESCHED_EXIT
-};
-struct ReplayDeschedState {
-  /* Is this an arm or disarm request? */
-  ReplayDeschedType type;
-  /* What's our next step to retire the ioctl? */
-  ReplayDeschedEnterExit state;
-};
-
-/**
- * The state of a syscallbuf flush that's being processed.  Syscallbuf
- * flushes are an odd duck among the trace-step types (along with the
- * desched step above), because they must maintain extra state in
- * order to know which commands to issue when being resumed after an
- * interruption.  So the process of flushing the syscallbuf will
- * mutate this state in between attempts to retire the step.
- */
-enum ReplayFlushBufferedSyscallStep {
-  FLUSH_START,
-  FLUSH_ARM,
-  FLUSH_ENTER,
-  FLUSH_EXIT,
-  FLUSH_DISARM,
-  FLUSH_DONE
-};
-/**
  * ReplayFlushBufferedSyscallState is saved in Session and cloned with its
  * Session, so it needs to be simple data, i.e. not holding pointers to
  * per-Session data.
  */
 struct ReplayFlushBufferedSyscallState {
-  /* True when we need to write the syscallbuf data back to
-   * the child. */
-  bool need_buffer_restore;
-  /* After the data is restored, the number of record bytes that
-   * still need to be flushed. */
-  size_t num_rec_bytes_remaining;
-  /* The offset of the next syscall record in both the rr and child
-   * buffers */
-  size_t syscall_record_offset;
-  /* The next step to take. */
-  ReplayFlushBufferedSyscallStep state;
-  /* Track the state of retiring desched arm/disarm ioctls, when
-   * necessary. */
-  ReplayDeschedState desched;
+  /* An internal breakpoint is set at this address */
+  uintptr_t stop_breakpoint_addr;
 };
 
 /**
@@ -97,22 +51,11 @@ enum ReplayTraceStepType {
   /* Replay until we enter the next syscall, then patch it. */
   TSTEP_PATCH_SYSCALL,
 
-  /* Emulate arming or disarming the desched event.  |desched|
-   * tracks the replay state. */
-  TSTEP_DESCHED,
+  /* Exit the task */
+  TSTEP_EXIT_TASK,
 
   /* Frame has been replayed, done. */
   TSTEP_RETIRE,
-};
-
-enum ExecOrEmulate {
-  EXEC = 0,
-  EMULATE = 1
-};
-
-enum ExecOrEmulateReturn {
-  EXEC_RETURN = 0,
-  EMULATE_RETURN = 1
 };
 
 /**
@@ -127,12 +70,7 @@ struct ReplayTraceStep {
       /* The syscall number we expect to
        * enter/exit. */
       int number;
-      /* Is the kernel entry and exit for this
-       * syscall emulated, that is, not executed? */
-      ExecOrEmulate emu;
     } syscall;
-
-    int signo;
 
     struct {
       Ticks ticks;
@@ -140,8 +78,6 @@ struct ReplayTraceStep {
     } target;
 
     ReplayFlushBufferedSyscallState flush;
-
-    ReplayDeschedState desched;
   };
 };
 
@@ -233,6 +169,9 @@ public:
   /** Collect garbage files from this session's emufs. */
   void gc_emufs();
 
+  /** Run emufs gc if this syscall may release a file */
+  void maybe_gc_emufs(SupportedArch arch, int syscallno);
+
   TraceReader& trace_reader() { return trace_in; }
   const TraceReader& trace_reader() const { return trace_in; }
 
@@ -251,18 +190,21 @@ public:
   }
 
   /**
+   * Returns true if the next step for this session is to exit a syscall with
+   * the given number.
+   */
+  bool next_step_is_syscall_exit(int syscallno);
+
+  /**
    * The current ReplayStepKey.
    */
   ReplayStepKey current_step_key() const {
     return ReplayStepKey(current_step.action);
   }
 
-  /**
-   * If we've finished replaying (all tracees terminated), return the last
-   * Task that ran. Sometimes debuggers need this. Returns null if replay
-   * hasn't finished yet.
-   */
-  Task* last_task() { return last_debugged_task; }
+  Ticks ticks_at_start_of_current_event() const {
+    return ticks_at_start_of_event;
+  }
 
   /**
    * Create a replay session that will use the trace directory specified
@@ -277,9 +219,9 @@ public:
     TraceFrame::Time stop_at_time;
     Ticks ticks_target;
     // When the RunCommand is RUN_SINGLESTEP_FAST_FORWARD, stop if the next
-    // singlestep would enter one of the register states in this (null-
-    // terminated) list. RUN_SINGLESTEP_FAST_FORWARD will always singlestep
-    // at least once regardless.
+    // singlestep would enter one of the register states in this list.
+    // RUN_SINGLESTEP_FAST_FORWARD will always singlestep at least once
+    // regardless.
     std::vector<const Registers*> stop_before_states;
 
     bool is_singlestep() const {
@@ -331,82 +273,44 @@ public:
 private:
   ReplaySession(const std::string& dir)
       : emu_fs(EmuFs::create()),
-        last_debugged_task(nullptr),
         trace_in(dir),
         trace_frame(),
-        current_step() {
-    advance_to_next_trace_frame(0);
+        current_step(),
+        ticks_at_start_of_event(0) {
+    advance_to_next_trace_frame();
   }
 
   ReplaySession(const ReplaySession& other)
       : Session(other),
         emu_fs(other.emu_fs->clone()),
-        last_debugged_task(nullptr),
         trace_in(other.trace_in),
         trace_frame(other.trace_frame),
         current_step(other.current_step),
+        ticks_at_start_of_event(other.ticks_at_start_of_event),
         cpuid_bug_detector(other.cpuid_bug_detector),
-        flags(other.flags) {
-    assert(!other.last_debugged_task);
-  }
-
-  /**
-   * Set |t| as the last (debugged) task in this session.
-   *
-   * When we notify the debugger of process exit, it wants to be
-   * able to poke around at that last task.  So we store it here
-   * to allow processing debugger requests for it later.
-   */
-  void set_last_task(Task* t) {
-    assert(!last_debugged_task);
-    last_debugged_task = t;
-  }
-
-  const struct syscallbuf_hdr* syscallbuf_flush_buffer_hdr() {
-    return (const struct syscallbuf_hdr*)syscallbuf_flush_buffer_array;
-  }
+        flags(other.flags) {}
 
   void setup_replay_one_trace_frame(Task* t);
-  void advance_to_next_trace_frame(TraceFrame::Time stop_at_time);
-  Completion emulate_signal_delivery(Task* oldtask, int sig,
-                                     const StepConstraints& constraints);
+  void advance_to_next_trace_frame();
+  Completion emulate_signal_delivery(Task* oldtask, int sig);
   Completion try_one_trace_step(Task* t,
                                 const StepConstraints& step_constraints);
-  Completion cont_syscall_boundary(Task* t, ExecOrEmulate emu,
-                                   const StepConstraints& constraints);
+  Completion cont_syscall_boundary(Task* t, const StepConstraints& constraints);
   Completion enter_syscall(Task* t, const StepConstraints& constraints);
-  Completion exit_syscall(Task* t, const StepConstraints& constraints);
-  Ticks get_ticks_slack(Task* t);
+  Completion exit_syscall(Task* t);
+  Completion exit_task(Task* t);
   void check_ticks_consistency(Task* t, const Event& ev);
   void check_pending_sig(Task* t);
   void continue_or_step(Task* t, const StepConstraints& constraints,
-                        int64_t tick_period = 0);
-  enum ExecStateType {
-    UNKNOWN,
-    NOT_AT_TARGET,
-    AT_TARGET
-  };
-  TrapType compute_trap_type(Task* t, int target_sig,
-                             SignalDeterministic deterministic,
-                             ExecStateType exec_state,
-                             const StepConstraints& constraints);
-  bool is_debugger_trap(Task* t, int target_sig,
-                        SignalDeterministic deterministic,
-                        ExecStateType exec_state,
-                        const StepConstraints& constraints);
-  Completion advance_to(Task* t, const Registers& regs, int sig,
-                        const StepConstraints& constraints, Ticks ticks);
+                        TicksRequest tick_request,
+                        ResumeRequest resume_how = RESUME_SYSCALL);
   Completion advance_to_ticks_target(Task* t,
                                      const StepConstraints& constraints);
   Completion emulate_deterministic_signal(Task* t, int sig,
                                           const StepConstraints& constraints);
-  Completion emulate_async_signal(Task* t, int sig,
-                                  const StepConstraints& constraints,
+  Completion emulate_async_signal(Task* t, const StepConstraints& constraints,
                                   Ticks ticks);
-  Completion skip_desched_ioctl(Task* t, ReplayDeschedState* ds,
-                                const StepConstraints& constraints);
   void prepare_syscallbuf_records(Task* t);
-  Completion flush_one_syscall(Task* t, const StepConstraints& constraints);
   Completion flush_syscallbuf(Task* t, const StepConstraints& constraints);
   Completion patch_next_syscall(Task* t, const StepConstraints& constraints);
   void check_approaching_ticks_target(Task* t,
@@ -414,25 +318,13 @@ private:
                                       BreakStatus& break_status);
 
   std::shared_ptr<EmuFs> emu_fs;
-  Task* last_debugged_task;
   TraceReader trace_in;
   TraceFrame trace_frame;
   ReplayTraceStep current_step;
+  Ticks ticks_at_start_of_event;
   CPUIDBugDetector cpuid_bug_detector;
   Flags flags;
   bool did_fast_forward;
-  /**
-   * Buffer for recorded syscallbuf bytes.  By definition buffer flushes
-   * must be replayed sequentially, so we can use one buffer for all
-   * tracees.  At the start of the flush, the recorded bytes are read
-   * back into this buffer.  Then they're copied back to the tracee
-   * record-by-record, as the tracee exits those syscalls.
-   * This needs to be word-aligned.
-   */
-  union {
-    uint8_t syscallbuf_flush_buffer_array[SYSCALLBUF_BUFFER_SIZE];
-    uint64_t align_padding;
-  };
 };
 
 #endif // RR_REPLAY_SESSION_H_

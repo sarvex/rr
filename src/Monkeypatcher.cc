@@ -4,15 +4,40 @@
 
 #include "Monkeypatcher.h"
 
+#include "AddressSpace.h"
+#include "AutoRemoteSyscalls.h"
+#include "elf.h"
 #include "kernel_abi.h"
+#include "kernel_metadata.h"
 #include "log.h"
 #include "ReplaySession.h"
+#include "ScopedFd.h"
 #include "task.h"
 
 using namespace rr;
 using namespace std;
 
 #include "AssemblyTemplates.generated"
+
+static void write_and_record_bytes(Task* t, remote_ptr<void> child_addr,
+                                   size_t size, const void* buf) {
+  t->write_bytes_helper(child_addr, size, buf);
+  t->record_local(child_addr, size, buf);
+}
+
+template <size_t N>
+static void write_and_record_bytes(Task* t, remote_ptr<void> child_addr,
+                                   const uint8_t(&buf)[N]) {
+  write_and_record_bytes(t, child_addr, N, buf);
+}
+
+template <typename T>
+static void write_and_record_mem(Task* t, remote_ptr<T> child_addr,
+                                 const T* val, int count) {
+  t->write_bytes_helper(child_addr, sizeof(*val) * count,
+                        static_cast<const void*>(val));
+  t->record_local(child_addr, sizeof(T) * count, val);
+}
 
 /**
  * RecordSession sets up an LD_PRELOAD environment variable with an entry
@@ -72,86 +97,286 @@ template <typename Arch> static void setup_preload_library_path(Task* t) {
       return;
     }
     remote_ptr<void> dest = envp + lib_pos;
-    t->write_mem(dest.cast<char>(), lib_name,
-                 sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1);
+    write_and_record_mem(t, dest.cast<char>(), lib_name,
+                         sizeof(SYSCALLBUF_LIB_FILENAME_PADDED) - 1);
     return;
   }
 }
 
 void Monkeypatcher::init_dynamic_syscall_patching(
     Task* t, int syscall_patch_hook_count,
-    remote_ptr<struct syscall_patch_hook> syscall_patch_hooks) {
+    remote_ptr<struct syscall_patch_hook> syscall_patch_hooks,
+    remote_ptr<void> stub_buffer, remote_ptr<void> stub_buffer_end,
+    remote_ptr<void> syscall_hook_trampoline) {
   if (syscall_patch_hook_count) {
     syscall_hooks = t->read_mem(syscall_patch_hooks, syscall_patch_hook_count);
   }
+  this->stub_buffer = stub_buffer;
+  this->stub_buffer_end = stub_buffer_end;
+  this->syscall_hook_trampoline = syscall_hook_trampoline;
+  ASSERT(t, syscall_hook_trampoline < stub_buffer_end);
 }
 
 template <typename Arch>
-static bool patch_syscall_with_hook_arch(Task* t,
+static bool patch_syscall_with_hook_arch(Monkeypatcher& patcher, Task* t,
                                          const syscall_patch_hook& hook);
 
-static bool patch_syscall_with_hook_x86ish(Task* t,
+remote_ptr<uint8_t> Monkeypatcher::allocate_stub(Task* t, size_t bytes) {
+  if (!stub_buffer) {
+    return nullptr;
+  }
+  ASSERT(t, (stub_buffer_end - stub_buffer) % bytes == 0)
+      << "Stub size mismatch";
+  if (stub_buffer + stub_buffer_allocated + bytes > stub_buffer_end) {
+    return nullptr;
+  }
+  auto result = stub_buffer.cast<uint8_t>() + stub_buffer_allocated;
+  stub_buffer_allocated += bytes;
+  return result;
+}
+
+template <typename StubPatch>
+static void substitute(uint8_t* buffer, uint64_t return_addr,
+                       uint32_t trampoline_relative_addr);
+
+template <>
+void substitute<X86SyscallStubMonkeypatch>(uint8_t* buffer,
+                                           uint64_t return_addr,
+                                           uint32_t trampoline_relative_addr) {
+  X86SyscallStubMonkeypatch::substitute(buffer, (uint32_t)return_addr,
+                                        trampoline_relative_addr);
+}
+
+template <>
+void substitute<X64SyscallStubMonkeypatch>(uint8_t* buffer,
+                                           uint64_t return_addr,
+                                           uint32_t trampoline_relative_addr) {
+  X64SyscallStubMonkeypatch::substitute(buffer, (uint32_t)return_addr,
+                                        (uint32_t)(return_addr >> 32),
+                                        trampoline_relative_addr);
+}
+
+template <typename ExtendedJumpPatch>
+static void substitute_extended_jump(uint8_t* buffer, uint64_t from_end,
+                                     uint64_t to_start);
+
+template <>
+void substitute_extended_jump<X86SyscallStubExtendedJump>(uint8_t* buffer,
+                                                          uint64_t from_end,
+                                                          uint64_t to_start) {
+  int64_t offset = to_start - from_end;
+  // An offset that appears to be > 2GB is OK here, since EIP will just
+  // wrap around.
+  X86SyscallStubExtendedJump::substitute(buffer, (int32_t)offset);
+}
+
+template <>
+void substitute_extended_jump<X64SyscallStubExtendedJump>(uint8_t* buffer,
+                                                          uint64_t,
+                                                          uint64_t to_start) {
+  X64SyscallStubExtendedJump::substitute(buffer, to_start);
+}
+
+/**
+ * Allocate an extended jump in an extended jump page and return its address.
+ * The resulting address must be within 2G of from_end, and the instruction
+ * there must jump to to_start.
+ */
+template <typename ExtendedJumpPatch>
+static remote_ptr<uint8_t> allocate_extended_jump(
+    Task* t, vector<Monkeypatcher::ExtendedJumpPage>& pages,
+    remote_ptr<uint8_t> from_end, remote_ptr<uint8_t> to_start) {
+  Monkeypatcher::ExtendedJumpPage* page = nullptr;
+  for (auto& p : pages) {
+    remote_ptr<uint8_t> page_jump_start = p.addr + p.allocated;
+    int64_t offset = page_jump_start - from_end;
+    if ((int32_t)offset == offset &&
+        p.allocated + ExtendedJumpPatch::size <= page_size()) {
+      page = &p;
+      break;
+    }
+  }
+
+  if (!page) {
+    // Find free space after the patch site.
+    auto maps =
+        t->vm()->maps_starting_at(t->vm()->mapping_of(from_end).map.start());
+    auto current = maps.begin();
+    // We're looking for a gap of three pages --- one page to allocate and
+    // a page on each side as a guard page.
+    uint32_t required_space = 3 * page_size();
+    while (current != maps.end()) {
+      auto next = current;
+      ++next;
+      if (next == maps.end()) {
+        if (current->map.end() + required_space >= current->map.end()) {
+          break;
+        }
+      } else {
+        if (current->map.end() + required_space <= next->map.start()) {
+          break;
+        }
+      }
+      current = next;
+    }
+    if (current == maps.end()) {
+      LOG(debug) << "Can't find space for our jump page";
+      return nullptr;
+    }
+
+    remote_ptr<uint8_t> addr =
+        (current->map.end() + page_size()).cast<uint8_t>();
+    int64_t offset = addr - from_end;
+    if ((int32_t)offset != offset) {
+      LOG(debug) << "Can't find space close enough for the jump";
+      return nullptr;
+    }
+
+    {
+      AutoRemoteSyscalls remote(t);
+      int prot = PROT_READ | PROT_EXEC;
+      int flags = MAP_ANONYMOUS | MAP_FIXED | MAP_PRIVATE;
+      remote.infallible_mmap_syscall(addr, page_size(), prot, flags, -1, 0);
+      KernelMapping recorded(addr, addr + page_size(), string(),
+                             KernelMapping::NO_DEVICE, KernelMapping::NO_INODE,
+                             prot, flags);
+      t->vm()->map(addr, page_size(), prot, flags, 0, string(),
+                   KernelMapping::NO_DEVICE, KernelMapping::NO_INODE,
+                   &recorded);
+      t->trace_writer().write_mapped_region(recorded, recorded.fake_stat(),
+                                            TraceWriter::PATCH_MAPPING);
+    }
+
+    pages.push_back(Monkeypatcher::ExtendedJumpPage(addr));
+    page = &pages.back();
+  }
+
+  uint8_t jump_patch[ExtendedJumpPatch::size];
+  remote_ptr<uint8_t> jump_addr = page->addr + page->allocated;
+  substitute_extended_jump<ExtendedJumpPatch>(
+      jump_patch, jump_addr.as_int() + sizeof(jump_patch), to_start.as_int());
+  write_and_record_bytes(t, jump_addr, jump_patch);
+  page->allocated += sizeof(jump_patch);
+  return jump_addr;
+}
+
+/**
+ * Some functions make system calls while storing local variables in memory
+ * below the stack pointer. We need to decrement the stack pointer by
+ * some "safety zone" amount to get clear of those variables before we make
+ * a call instruction. So, we allocate a stub per patched callsite, and jump
+ * from the callsite to the stub. The stub decrements the stack pointer,
+ * calls the appropriate syscall hook function, reincrements the stack pointer,
+ * and jumps back to immediately after the patched callsite.
+ *
+ * It's important that gdb stack traces work while a thread is stopped in the
+ * syscallbuf code. To ensure that the above manipulations don't foil gdb's
+ * stack walking code, we add CFI data to all the stubs. To ease that, the
+ * stubs are written in assembly and linked into the preload library.
+ *
+ * On x86-64 with ASLR, we need to be able to patch a call to a stub from
+ * sites more than 2^31 bytes away. We only have space for a 5-byte jump
+ * instruction. So, we allocate "extender pages" --- pages of memory within
+ * 2GB of the patch site, within which we allocate instructions that can jump
+ * anywhere in memory. We don't really need this on x86, but we do it there
+ * too for consistency.
+ *
+ * trampoline_call_end is the offset within the StubPatch where the call to
+ * the trampoline ends.
+ */
+template <typename JumpPatch, typename ExtendedJumpPatch, typename StubPatch,
+          uint32_t trampoline_call_end>
+static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher, Task* t,
                                            const syscall_patch_hook& hook) {
-  // We can use the same patch code on x86 and x86-64.
-  uint8_t patch[X86CallMonkeypatch::size];
-  // We're patching in a relative jump, so we need to compute the offset from
-  // the end of the jump to our actual destination.
-  remote_ptr<uint8_t> patch_start = t->regs().ip();
-  remote_ptr<uint8_t> patch_end = patch_start + sizeof(patch);
-  intptr_t offset = hook.hook_address - patch_end.as_int();
-  int32_t offset32 = (int32_t)offset;
-  if (offset32 != offset) {
-    LOG(debug) << "syscall can't be patched due to jump out of range from "
-               << HEX(patch_end.as_int()) << " to " << HEX(hook.hook_address);
+  uint8_t stub_patch[StubPatch::size];
+  auto stub_patch_start = patcher.allocate_stub(t, sizeof(stub_patch));
+  if (!stub_patch_start) {
+    LOG(debug) << "syscall can't be patched due to stub allocation failure";
     return false;
   }
-  X86CallMonkeypatch::substitute(patch, offset32);
-  t->write_bytes(patch_start, patch);
+  auto stub_patch_after_trampoline_call =
+      stub_patch_start + trampoline_call_end;
+
+  uint8_t jump_patch[JumpPatch::size];
+  // We're patching in a relative jump, so we need to compute the offset from
+  // the end of the jump to our actual destination.
+  auto jump_patch_start = t->regs().ip().to_data_ptr<uint8_t>();
+  auto jump_patch_end = jump_patch_start + sizeof(jump_patch);
+
+  remote_ptr<uint8_t> extended_jump_start =
+      allocate_extended_jump<ExtendedJumpPatch>(
+          t, patcher.extended_jump_pages, jump_patch_end, stub_patch_start);
+  if (extended_jump_start.is_null()) {
+    return false;
+  }
+  intptr_t jump_offset = extended_jump_start - jump_patch_end;
+  int32_t jump_offset32 = (int32_t)jump_offset;
+  ASSERT(t, jump_offset32 == jump_offset)
+      << "allocate_extended_jump didn't work";
+
+  intptr_t trampoline_call_offset =
+      hook.hook_address - stub_patch_after_trampoline_call.as_int();
+  int32_t trampoline_call_offset32 = (int32_t)trampoline_call_offset;
+  ASSERT(t, trampoline_call_offset32 == trampoline_call_offset)
+      << "How did the stub area get far away from the hooks?";
+
+  JumpPatch::substitute(jump_patch, jump_offset32);
+  write_and_record_bytes(t, jump_patch_start, jump_patch);
 
   // pad with NOPs to the next instruction
   static const uint8_t NOP = 0x90;
-  assert(syscall_instruction_length(x86) == syscall_instruction_length(x86_64));
-  uint8_t nops[syscall_instruction_length(x86) + hook.next_instruction_length -
-               sizeof(patch)];
+  assert(syscall_instruction_length(x86_64) == syscall_instruction_length(x86));
+  uint8_t nops[syscall_instruction_length(x86_64) +
+               hook.next_instruction_length - sizeof(jump_patch)];
   memset(nops, NOP, sizeof(nops));
-  t->write_mem(patch_start + sizeof(patch), nops, sizeof(nops));
+  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops,
+                       sizeof(nops));
+
+  // Now write out the stub
+  substitute<StubPatch>(stub_patch, jump_patch_end.as_int(),
+                        trampoline_call_offset32);
+  write_and_record_bytes(t, stub_patch_start, stub_patch);
+
   return true;
 }
 
 template <>
-bool patch_syscall_with_hook_arch<X86Arch>(Task* t,
+bool patch_syscall_with_hook_arch<X86Arch>(Monkeypatcher& patcher, Task* t,
                                            const syscall_patch_hook& hook) {
-  return patch_syscall_with_hook_x86ish(t, hook);
+  return patch_syscall_with_hook_x86ish<X86SysenterVsyscallSyscallHook,
+                                        X86SyscallStubExtendedJump,
+                                        X86SyscallStubMonkeypatch, 30>(patcher,
+                                                                       t, hook);
 }
 
 template <>
-bool patch_syscall_with_hook_arch<X64Arch>(Task* t,
+bool patch_syscall_with_hook_arch<X64Arch>(Monkeypatcher& patcher, Task* t,
                                            const syscall_patch_hook& hook) {
-  return patch_syscall_with_hook_x86ish(t, hook);
+  return patch_syscall_with_hook_x86ish<X64JumpMonkeypatch,
+                                        X64SyscallStubExtendedJump,
+                                        X64SyscallStubMonkeypatch, 43>(patcher,
+                                                                       t, hook);
 }
 
-static bool patch_syscall_with_hook(Task* t, const syscall_patch_hook& hook) {
-  RR_ARCH_FUNCTION(patch_syscall_with_hook_arch, t->arch(), t, hook);
-}
-
-// TODO de-dup
-static void advance_syscall(Task* t) {
-  do {
-    t->cont_syscall();
-  } while (t->is_ptrace_seccomp_event() ||
-           ReplaySession::is_ignored_signal(t->pending_sig()));
-  assert(t->ptrace_event() == 0);
+static bool patch_syscall_with_hook(Monkeypatcher& patcher, Task* t,
+                                    const syscall_patch_hook& hook) {
+  RR_ARCH_FUNCTION(patch_syscall_with_hook_arch, t->arch(), patcher, t, hook);
 }
 
 bool Monkeypatcher::try_patch_syscall(Task* t) {
-  if (!t->vm()->syscallbuf_enabled()) {
+  if (syscall_hooks.empty()) {
+    // Syscall hooks not set up yet. Don't spew warnings, and don't
+    // fill tried_to_patch_syscall_addresses with addresses that we might be
+    // able to patch later.
     return false;
   }
   if (t->is_in_traced_syscall()) {
     // Never try to patch the traced-syscall in our preload library!
     return false;
   }
-  if (tried_to_patch_syscall_addresses.count(t->ip().as_int())) {
+
+  Registers r = t->regs();
+  if (tried_to_patch_syscall_addresses.count(r.ip())) {
     return false;
   }
   // We could examine the current syscall number and if it's not one that
@@ -164,87 +389,190 @@ bool Monkeypatcher::try_patch_syscall(Task* t) {
   // Also, implementing that would require keeping a buffered-syscalls
   // list in sync with the preload code, which is unnecessary complexity.
 
-  tried_to_patch_syscall_addresses.insert(t->ip().as_int());
+  tried_to_patch_syscall_addresses.insert(r.ip());
 
   syscall_patch_hook dummy;
-  auto next_instruction =
-      t->read_mem(t->ip(), sizeof(dummy.next_instruction_bytes));
+  auto next_instruction = t->read_mem(r.ip().to_data_ptr<uint8_t>(),
+                                      sizeof(dummy.next_instruction_bytes));
+  intptr_t syscallno = r.original_syscallno();
   for (auto& hook : syscall_hooks) {
     if (memcmp(next_instruction.data(), hook.next_instruction_bytes,
                hook.next_instruction_length) == 0) {
       // Get out of executing the current syscall before we patch it.
+      t->exit_syscall_and_prepare_restart();
 
-      Registers r = t->regs();
-      intptr_t syscallno = r.original_syscallno();
-      r.set_original_syscallno(syscall_number_for_gettid(t->arch()));
-      t->set_regs(r);
-      // This exits the hijacked SYS_gettid.  Now the tracee is
-      // ready to do our bidding.
-      advance_syscall(t);
+      patch_syscall_with_hook(*this, t, hook);
 
-      // Restore these regs to what they would have been just before
-      // the tracee trapped at the syscall.
-      r.set_original_syscallno(-1);
-      r.set_syscallno(syscallno);
-      r.set_ip(r.ip() - syscall_instruction_length(t->arch()));
-      t->set_regs(r);
-
-      patch_syscall_with_hook(t, hook);
-
+      LOG(debug) << "Patched syscall at " << r.ip() << " syscall "
+                 << syscall_name(syscallno, t->arch()) << " tid " << t->tid
+                 << " bytes " << next_instruction;
       // Return to caller, which resume normal execution.
       return true;
     }
   }
+  LOG(debug) << "Failed to patch syscall at " << r.ip() << " syscall "
+             << syscall_name(syscallno, t->arch()) << " tid " << t->tid
+             << " bytes " << next_instruction;
   return false;
 }
 
-template <typename Arch> struct VdsoSymbols {
-  vector<typename Arch::ElfSym> symbols;
+class SymbolTable {
+public:
+  bool is_name(size_t i, const char* name) const {
+    size_t offset = symbols[i].name_index;
+    return offset < strtab.size() && strcmp(&strtab[offset], name) == 0;
+  }
+  uintptr_t file_offset(size_t i) const { return symbols[i].file_offset; }
+  size_t size() const { return symbols.size(); }
+
+  struct Symbol {
+    Symbol(uintptr_t file_offset, size_t name_index)
+        : file_offset(file_offset), name_index(name_index) {}
+    Symbol() {}
+    uintptr_t file_offset;
+    size_t name_index;
+  };
+  vector<Symbol> symbols;
   vector<char> strtab;
 };
 
-template <typename Arch> static VdsoSymbols<Arch> read_vdso_symbols(Task* t) {
-  auto vdso_start = t->vm()->vdso().start;
-  auto elfheader = t->read_mem(vdso_start.cast<typename Arch::ElfEhdr>());
-  assert(elfheader.e_ident[EI_CLASS] == Arch::elfclass);
-  assert(elfheader.e_ident[EI_DATA] == Arch::elfendian);
-  assert(elfheader.e_machine == Arch::elfmachine);
-  assert(elfheader.e_shentsize == sizeof(typename Arch::ElfShdr));
+class ElfReader {
+public:
+  virtual ~ElfReader() {}
+  virtual bool read(size_t offset, size_t size, void* buf) = 0;
+  template <typename T> bool read(size_t offset, T& result) {
+    return read(offset, sizeof(result), &result);
+  }
+  template <typename T> vector<T> read(size_t offset, size_t count) {
+    vector<T> result;
+    result.resize(count);
+    if (!read(offset, sizeof(T) * count, result.data())) {
+      result.clear();
+    }
+    return result;
+  }
+  template <typename Arch>
+  SymbolTable read_symbols_arch(const char* symtab, const char* strtab);
+  SymbolTable read_symbols(SupportedArch arch, const char* symtab,
+                           const char* strtab);
+};
 
-  auto sections_start = vdso_start + elfheader.e_shoff;
-  typename Arch::ElfShdr sections[elfheader.e_shnum];
-  t->read_bytes_helper(sections_start, sizeof(sections), sections);
+template <typename Arch>
+SymbolTable ElfReader::read_symbols_arch(const char* symtab,
+                                         const char* strtab) {
+  SymbolTable result;
+  typename Arch::ElfEhdr elfheader;
+  if (!read(0, elfheader) || memcmp(&elfheader, ELFMAG, SELFMAG) != 0 ||
+      elfheader.e_ident[EI_CLASS] != Arch::elfclass ||
+      elfheader.e_ident[EI_DATA] != Arch::elfendian ||
+      elfheader.e_machine != Arch::elfmachine ||
+      elfheader.e_shentsize != sizeof(typename Arch::ElfShdr) ||
+      elfheader.e_shstrndx >= elfheader.e_shnum) {
+    LOG(debug) << "Invalid ELF file: invalid header";
+    return result;
+  }
 
-  typename Arch::ElfShdr* dynsym = nullptr;
-  typename Arch::ElfShdr* dynstr = nullptr;
+  auto sections =
+      read<typename Arch::ElfShdr>(elfheader.e_shoff, elfheader.e_shnum);
+  if (sections.empty()) {
+    LOG(debug) << "Invalid ELF file: no sections";
+    return result;
+  }
 
+  auto& section_names_section = sections[elfheader.e_shstrndx];
+  auto section_names = read<char>(section_names_section.sh_offset,
+                                  section_names_section.sh_size);
+  if (section_names.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read section names";
+    return result;
+  }
+  section_names[section_names.size() - 1] = 0;
+
+  typename Arch::ElfShdr* symbols = nullptr;
+  typename Arch::ElfShdr* strings = nullptr;
   for (size_t i = 0; i < elfheader.e_shnum; ++i) {
-    auto header = &sections[i];
-    if (header->sh_type == SHT_DYNSYM) {
-      assert(!dynsym && "multiple .dynsym sections?!");
-      dynsym = header;
+    auto& s = sections[i];
+    if (s.sh_name >= section_names.size()) {
+      LOG(debug) << "Invalid ELF file: invalid name offset for section " << i;
+      return result;
+    }
+    const char* name = section_names.data() + s.sh_name;
+    if (strcmp(name, symtab) == 0) {
+      if (symbols) {
+        LOG(debug) << "Invalid ELF file: duplicate symbol section " << symtab;
+        return result;
+      }
+      symbols = &s;
+    }
+    if (strcmp(name, strtab) == 0) {
+      if (strings) {
+        LOG(debug) << "Invalid ELF file: duplicate string section " << strtab;
+        return result;
+      }
+      strings = &s;
+    }
+  }
+
+  if (!symbols) {
+    LOG(debug) << "Invalid ELF file: missing symbol section " << symtab;
+    return result;
+  }
+  if (!strings) {
+    LOG(debug) << "Invalid ELF file: missing string section " << strtab;
+    return result;
+  }
+  if (symbols->sh_entsize != sizeof(typename Arch::ElfSym)) {
+    LOG(debug) << "Invalid ELF file: incorrect symbol size "
+               << symbols->sh_entsize;
+    return result;
+  }
+  if (symbols->sh_size % symbols->sh_entsize) {
+    LOG(debug) << "Invalid ELF file: incorrect symbol section size "
+               << symbols->sh_size;
+    return result;
+  }
+
+  auto symbol_list = read<typename Arch::ElfSym>(
+      symbols->sh_offset, symbols->sh_size / symbols->sh_entsize);
+  if (symbol_list.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read symbols " << symtab;
+    return result;
+  }
+  result.strtab = read<char>(strings->sh_offset, strings->sh_size);
+  if (result.strtab.empty()) {
+    LOG(debug) << "Invalid ELF file: can't read strings " << strtab;
+  }
+  result.symbols.resize(symbol_list.size());
+  for (size_t i = 0; i < symbol_list.size(); ++i) {
+    auto& s = symbol_list[i];
+    if (s.st_shndx >= sections.size()) {
       continue;
     }
-    if (header->sh_type == SHT_STRTAB && (header->sh_flags & SHF_ALLOC) &&
-        i != elfheader.e_shstrndx) {
-      assert(!dynstr && "multiple .dynstr sections?!");
-      dynstr = header;
-    }
+    auto& section = sections[s.st_shndx];
+    result.symbols[i] = SymbolTable::Symbol(
+        s.st_value - section.sh_addr + section.sh_offset, s.st_name);
   }
-
-  if (!dynsym || !dynstr) {
-    assert(0 && "Unable to locate vdso information");
-  }
-
-  assert(dynsym->sh_entsize == sizeof(typename Arch::ElfSym));
-  remote_ptr<void> symbols_start = vdso_start + dynsym->sh_offset;
-  size_t nsymbols = dynsym->sh_size / dynsym->sh_entsize;
-  remote_ptr<void> strtab_start = vdso_start + dynstr->sh_offset;
-  VdsoSymbols<Arch> result;
-  result.symbols =
-      t->read_mem(symbols_start.cast<typename Arch::ElfSym>(), nsymbols);
-  result.strtab = t->read_mem(strtab_start.cast<char>(), dynstr->sh_size);
   return result;
+}
+
+SymbolTable ElfReader::read_symbols(SupportedArch arch, const char* symtab,
+                                    const char* strtab) {
+  RR_ARCH_FUNCTION(read_symbols_arch, arch, symtab, strtab);
+}
+
+class VdsoReader : public ElfReader {
+public:
+  VdsoReader(Task* t) : t(t) {}
+  virtual bool read(size_t offset, size_t size, void* buf) {
+    bool ok = true;
+    t->read_bytes_helper(t->vm()->vdso().start() + offset, size, buf, &ok);
+    return ok;
+  }
+  Task* t;
+};
+
+static SymbolTable read_vdso_symbols(Task* t) {
+  return VdsoReader(t).read_symbols(t->arch(), ".dynsym", ".dynstr");
 }
 
 /**
@@ -252,43 +580,46 @@ template <typename Arch> static VdsoSymbols<Arch> read_vdso_symbols(Task* t) {
  * implementation.
  */
 static bool is_kernel_vsyscall(Task* t, remote_ptr<void> addr) {
-  uint8_t impl[X86VsyscallImplementation::size];
+  uint8_t impl[X86SysenterVsyscallImplementation::size];
   t->read_bytes(addr, impl);
-  return X86VsyscallImplementation::match(impl);
+  return X86SysenterVsyscallImplementation::match(impl);
 }
 
 /**
  * Return the address of a recognized |__kernel_vsyscall()|
  * implementation in |t|'s address space.
  */
-static remote_ptr<void> locate_and_verify_kernel_vsyscall(Task* t) {
-  auto syms = read_vdso_symbols<X86Arch>(t);
-
+static remote_ptr<void> locate_and_verify_kernel_vsyscall(
+    Task* t, const SymbolTable& syms) {
   remote_ptr<void> kernel_vsyscall = nullptr;
   // It is unlikely but possible that multiple, versioned __kernel_vsyscall
   // symbols will exist.  But we can't rely on setting |kernel_vsyscall| to
   // catch that case, because only one of the versioned symbols will
   // actually match what we expect to see, and the matching one might be
   // the last one.  Therefore, we have this separate flag to alert us to
-  // this possbility.
+  // this possibility.
   bool seen_kernel_vsyscall = false;
 
-  for (auto& sym : syms.symbols) {
-    const char* name = &syms.strtab[sym.st_name];
-    if (strcmp(name, "__kernel_vsyscall") == 0) {
-      assert(!seen_kernel_vsyscall);
+  for (size_t i = 0; i < syms.size(); ++i) {
+    if (syms.is_name(i, "__kernel_vsyscall")) {
+      remote_ptr<void> candidate = syms.file_offset(i);
+      // The symbol values can be absolute or relative addresses.
+      // The first part of the assertion is for absolute
+      // addresses, and the second part is for relative.
+      if ((candidate.as_int() & ~uintptr_t(0xfff)) != 0xffffe000 &&
+          (candidate.as_int() & ~uintptr_t(0xfff)) != 0) {
+        // With 4.2.8-300.fc23.x86_64, execve_loop_32 seems to once in a while
+        // see a VDSO with a crazy file offset in it which is a duplicate
+        // __kernel_vsyscall. Bizzarro. Ignore it.
+        continue;
+      }
+      ASSERT(t, !seen_kernel_vsyscall);
       seen_kernel_vsyscall = true;
       // The ELF information in the VDSO assumes that the VDSO
       // is always loaded at a particular address.  The kernel,
       // however, subjects the VDSO to ASLR, which means that
       // we have to adjust the offsets properly.
-      auto vdso_start = t->vm()->vdso().start;
-      remote_ptr<void> candidate = sym.st_value;
-      // The symbol values can be absolute or relative addresses.
-      // The first part of the assertion is for absolute
-      // addresses, and the second part is for relative.
-      assert((candidate.as_int() & ~uintptr_t(0xfff)) == 0xffffe000 ||
-             (candidate.as_int() & ~uintptr_t(0xfff)) == 0);
+      auto vdso_start = t->vm()->vdso().start();
       uintptr_t candidate_offset = candidate.as_int() & uintptr_t(0xfff);
       candidate = vdso_start + candidate_offset;
 
@@ -301,13 +632,86 @@ static remote_ptr<void> locate_and_verify_kernel_vsyscall(Task* t) {
   return kernel_vsyscall;
 }
 
+// VDSOs are filled with overhead critical functions related to getting the
+// time and current CPU.  We need to ensure that these syscalls get redirected
+// into actual trap-into-the-kernel syscalls so rr can intercept them.
+
+template <typename Arch>
+static void patch_after_exec_arch(Task* t, Monkeypatcher& patcher);
+
 template <typename Arch>
 static void patch_at_preload_init_arch(Task* t, Monkeypatcher& patcher);
 
-template <typename Arch> static void patch_after_exec_arch(Task* t);
+struct named_syscall {
+  const char* name;
+  int syscall_number;
+};
 
-template <> void patch_after_exec_arch<X86Arch>(Task* t) {
+// Monkeypatch x86-32 vdso syscalls immediately after exec. The vdso syscalls
+// will cause replay to fail if called by the dynamic loader or some library's
+// static constructors, so we can't wait for our preload library to be
+// initialized. Fortunately we're just replacing the vdso code with real
+// syscalls so there is no dependency on the preload library at all.
+template <>
+void patch_after_exec_arch<X86Arch>(Task* t, Monkeypatcher& patcher) {
   setup_preload_library_path<X86Arch>(t);
+
+  auto syms = read_vdso_symbols(t);
+  patcher.x86_sysenter_vsyscall = locate_and_verify_kernel_vsyscall(t, syms);
+  if (!patcher.x86_sysenter_vsyscall) {
+    FATAL() << "Failed to monkeypatch vdso: your __kernel_vsyscall() wasn't "
+               "recognized.\n"
+               "    Syscall buffering is now effectively disabled.  If you're "
+               "OK with\n"
+               "    running rr without syscallbuf, then run the recorder "
+               "passing the\n"
+               "    --no-syscall-buffer arg.\n"
+               "    If you're *not* OK with that, file an issue.";
+  }
+
+  // Patch __kernel_vsyscall to use int 80 instead of sysenter.
+  // During replay we may remap the VDSO to a new address, and the sysenter
+  // instruction would return to the old address, so we must make sure sysenter
+  // is never used.
+  uint8_t patch[X86SysenterVsyscallUseInt80::size];
+  X86SysenterVsyscallUseInt80::substitute(patch);
+  write_and_record_bytes(t, patcher.x86_sysenter_vsyscall, patch);
+  LOG(debug) << "monkeypatched __kernel_vsyscall to use int $80";
+
+  auto vdso_start = t->vm()->vdso().start();
+
+  static const named_syscall syscalls_to_monkeypatch[] = {
+#define S(n)                                                                   \
+  { "__vdso_" #n, X86Arch::n }
+    S(clock_gettime), S(gettimeofday), S(time),
+#undef S
+  };
+
+  for (size_t i = 0; i < syms.size(); ++i) {
+    for (size_t j = 0; j < array_length(syscalls_to_monkeypatch); ++j) {
+      if (syms.is_name(i, syscalls_to_monkeypatch[j].name)) {
+        static const uintptr_t vdso_max_size = 0xffffLL;
+        uintptr_t sym_address = syms.file_offset(i);
+        if ((sym_address & ~vdso_max_size) != 0) {
+          // With 4.3.3-301.fc23.x86_64, once in a while we
+          // see a VDSO symbol with a crazy file offset in it which is a
+          // duplicate of another symbol. Bizzarro. Ignore it.
+          continue;
+        }
+
+        uintptr_t absolute_address = vdso_start.as_int() + sym_address;
+
+        uint8_t patch[X86VsyscallMonkeypatch::size];
+        uint32_t syscall_number = syscalls_to_monkeypatch[j].syscall_number;
+        X86VsyscallMonkeypatch::substitute(patch, syscall_number);
+
+        write_and_record_bytes(t, absolute_address, patch);
+        LOG(debug) << "monkeypatched " << syscalls_to_monkeypatch[j].name
+                   << " to syscall "
+                   << syscalls_to_monkeypatch[j].syscall_number;
+      }
+    }
+  }
 }
 
 // Monkeypatch x86 vsyscall hook only after the preload library
@@ -322,86 +726,69 @@ void patch_at_preload_init_arch<X86Arch>(Task* t, Monkeypatcher& patcher) {
     return;
   }
 
-  auto kernel_vsyscall = locate_and_verify_kernel_vsyscall(t);
-  if (!kernel_vsyscall) {
-    FATAL() << "Failed to monkeypatch vdso: your __kernel_vsyscall() wasn't "
-               "recognized.\n"
-               "    Syscall buffering is now effectively disabled.  If you're "
-               "OK with\n"
-               "    running rr without syscallbuf, then run the recorder "
-               "passing the\n"
-               "    --no-syscall-buffer arg.\n"
-               "    If you're *not* OK with that, file an issue.";
-  }
+  auto kernel_vsyscall = patcher.x86_sysenter_vsyscall;
 
   // Luckily, linux is happy for us to scribble directly over
   // the vdso mapping's bytes without mprotecting the region, so
   // we don't need to prepare remote syscalls here.
   remote_ptr<void> syscall_hook_trampoline = params.syscall_hook_trampoline;
 
-  uint8_t patch[X86VsyscallMonkeypatch::size];
+  uint8_t patch[X86SysenterVsyscallSyscallHook::size];
   // We're patching in a relative jump, so we need to compute the offset from
   // the end of the jump to our actual destination.
-  X86VsyscallMonkeypatch::substitute(
+  X86SysenterVsyscallSyscallHook::substitute(
       patch, syscall_hook_trampoline.as_int() -
                  (kernel_vsyscall + sizeof(patch)).as_int());
-
-  t->write_bytes(kernel_vsyscall, patch);
+  write_and_record_bytes(t, kernel_vsyscall, patch);
   LOG(debug) << "monkeypatched __kernel_vsyscall to jump to "
              << HEX(syscall_hook_trampoline.as_int());
 
-  patcher.init_dynamic_syscall_patching(t, params.syscall_patch_hook_count,
-                                        params.syscall_patch_hooks);
+  patcher.init_dynamic_syscall_patching(
+      t, params.syscall_patch_hook_count, params.syscall_patch_hooks,
+      params.syscall_hook_stub_buffer, params.syscall_hook_stub_buffer_end,
+      params.syscall_hook_trampoline);
 }
-
-// x86-64 doesn't have a convenient vsyscall-esque function in the VDSO;
-// syscalls happen directly with the |syscall| instruction and manual
-// syscall restarting if necessary.  Its VDSO is filled with overhead
-// critical functions related to getting the time and current CPU.  We
-// need to ensure that these syscalls get redirected into actual
-// trap-into-the-kernel syscalls so rr can intercept them.
-
-struct named_syscall {
-  const char* name;
-  int syscall_number;
-};
-
-#define S(n)                                                                   \
-  { #n, X64Arch::n }
-static const named_syscall syscalls_to_monkeypatch[] = {
-  S(clock_gettime), S(gettimeofday), S(time),
-  // getcpu isn't supported by rr, so any changes to this monkeypatching
-  // scheme for efficiency's sake will have to ensure that getcpu gets
-  // converted to an actual syscall so rr will complain appropriately.
-  S(getcpu),
-};
-#undef S
 
 // Monkeypatch x86-64 vdso syscalls immediately after exec. The vdso syscalls
 // will cause replay to fail if called by the dynamic loader or some library's
 // static constructors, so we can't wait for our preload library to be
 // initialized. Fortunately we're just replacing the vdso code with real
 // syscalls so there is no dependency on the preload library at all.
-template <> void patch_after_exec_arch<X64Arch>(Task* t) {
+template <> void patch_after_exec_arch<X64Arch>(Task* t, Monkeypatcher&) {
   setup_preload_library_path<X64Arch>(t);
 
-  auto vdso_start = t->vm()->vdso().start;
+  auto vdso_start = t->vm()->vdso().start();
 
-  auto syms = read_vdso_symbols<X64Arch>(t);
+  auto syms = read_vdso_symbols(t);
 
-  for (auto& sym : syms.symbols) {
-    const char* symname = &syms.strtab[sym.st_name];
+  static const named_syscall syscalls_to_monkeypatch[] = {
+#define S(n)                                                                   \
+  { "__vdso_" #n, X64Arch::n }
+    S(clock_gettime), S(gettimeofday), S(time),
+    // getcpu isn't supported by rr, so any changes to this monkeypatching
+    // scheme for efficiency's sake will have to ensure that getcpu gets
+    // converted to an actual syscall so rr will complain appropriately.
+    S(getcpu),
+#undef S
+  };
+
+  for (size_t i = 0; i < syms.size(); ++i) {
     for (size_t j = 0; j < array_length(syscalls_to_monkeypatch); ++j) {
-      if (strcmp(symname, syscalls_to_monkeypatch[j].name) == 0) {
+      if (syms.is_name(i, syscalls_to_monkeypatch[j].name)) {
         // Absolutely-addressed symbols in the VDSO claim to start here.
         static const uint64_t vdso_static_base = 0xffffffffff700000LL;
         static const uintptr_t vdso_max_size = 0xffffLL;
-        uintptr_t sym_address = uintptr_t(sym.st_value);
+        uintptr_t sym_address = syms.file_offset(i);
         // The symbol values can be absolute or relative addresses.
         // The first part of the assertion is for absolute
         // addresses, and the second part is for relative.
-        assert((sym_address & ~vdso_max_size) == vdso_static_base ||
-               (sym_address & ~vdso_max_size) == 0);
+        if (uint64_t(sym_address & ~vdso_max_size) != vdso_static_base &&
+            (sym_address & ~vdso_max_size) != 0) {
+          // With 4.3.3-301.fc23.x86_64, once in a while we
+          // see a VDSO symbol with a crazy file offset in it which is a
+          // duplicate of another symbol. Bizzarro. Ignore it.
+          continue;
+        }
         uintptr_t sym_offset = sym_address & vdso_max_size;
         uintptr_t absolute_address = vdso_start.as_int() + sym_offset;
 
@@ -409,8 +796,9 @@ template <> void patch_after_exec_arch<X64Arch>(Task* t) {
         uint32_t syscall_number = syscalls_to_monkeypatch[j].syscall_number;
         X64VsyscallMonkeypatch::substitute(patch, syscall_number);
 
-        t->write_bytes(absolute_address, patch);
-        LOG(debug) << "monkeypatched " << symname << " to syscall "
+        write_and_record_bytes(t, absolute_address, patch);
+        LOG(debug) << "monkeypatched " << syscalls_to_monkeypatch[j].name
+                   << " to syscall "
                    << syscalls_to_monkeypatch[j].syscall_number;
       }
     }
@@ -425,15 +813,17 @@ void patch_at_preload_init_arch<X64Arch>(Task* t, Monkeypatcher& patcher) {
     return;
   }
 
-  patcher.init_dynamic_syscall_patching(t, params.syscall_patch_hook_count,
-                                        params.syscall_patch_hooks);
+  patcher.init_dynamic_syscall_patching(
+      t, params.syscall_patch_hook_count, params.syscall_patch_hooks,
+      params.syscall_hook_stub_buffer, params.syscall_hook_stub_buffer_end,
+      params.syscall_hook_trampoline);
 }
 
 void Monkeypatcher::patch_after_exec(Task* t) {
   ASSERT(t, 1 == t->vm()->task_set().size())
       << "Can't have multiple threads immediately after exec!";
 
-  RR_ARCH_FUNCTION(patch_after_exec_arch, t->arch(), t);
+  RR_ARCH_FUNCTION(patch_after_exec_arch, t->arch(), t, *this);
 }
 
 void Monkeypatcher::patch_at_preload_init(Task* t) {
@@ -444,4 +834,66 @@ void Monkeypatcher::patch_at_preload_init(Task* t) {
   // we're processing the rrcall, because it's masked off all
   // signals.
   RR_ARCH_FUNCTION(patch_at_preload_init_arch, t->arch(), t, *this);
+}
+
+class FileReader : public ElfReader {
+public:
+  FileReader(ScopedFd& fd) : fd(fd) {}
+  virtual bool read(size_t offset, size_t size, void* buf) {
+    return pread(fd.get(), buf, size, offset) == ssize_t(size);
+  }
+  ScopedFd& fd;
+};
+
+static void set_and_record_bytes(Task* t, uint64_t file_offset,
+                                 const void* bytes, size_t size,
+                                 remote_ptr<void> map_start, size_t map_size,
+                                 size_t map_offset_pages) {
+  uint64_t map_offset = uint64_t(map_offset_pages) * page_size();
+  if (file_offset < map_offset || file_offset + size > map_offset + map_size) {
+    // The value(s) to be set are outside the mapped range. This happens
+    // because code and data can be mapped in separate, partial mmaps in which
+    // case some symbols will be outside the mapped range.
+    return;
+  }
+  remote_ptr<void> addr = map_start + uintptr_t(file_offset - map_offset);
+  bool ok = true;
+  t->write_bytes_helper(addr, size, bytes, &ok);
+  // Writing can fail when the value appears to be in the mapped range, but it
+  // actually is beyond the file length.
+  if (ok) {
+    t->record_local(addr, size, bytes);
+  }
+}
+
+void Monkeypatcher::patch_after_mmap(Task* t, remote_ptr<void> start,
+                                     size_t size, size_t offset_pages,
+                                     int child_fd) {
+  const auto& map = t->vm()->mapping_of(start);
+  if (map.map.fsname().find("libpthread") != string::npos &&
+      (t->arch() == x86 || t->arch() == x86_64)) {
+    ScopedFd open_fd = t->open_fd(child_fd, O_RDONLY);
+    ASSERT(t, open_fd.is_open()) << "Failed to open child fd " << child_fd;
+    auto syms =
+        FileReader(open_fd).read_symbols(t->arch(), ".symtab", ".strtab");
+    for (size_t i = 0; i < syms.size(); ++i) {
+      if (syms.is_name(i, "__elision_aconf")) {
+        static const int zero = 0;
+        // Setting __elision_aconf.retry_try_xbegin to zero means that
+        // pthread rwlocks don't try to use elision at all. See ELIDE_LOCK
+        // in glibc's elide.h.
+        set_and_record_bytes(t, syms.file_offset(i) + 8, &zero, sizeof(zero),
+                             start, size, offset_pages);
+      }
+      if (syms.is_name(i, "elision_init")) {
+        // Make elision_init return without doing anything. This means
+        // the __elision_available and __pthread_force_elision flags will
+        // remain zero, disabling elision for mutexes. See glibc's
+        // elision-conf.c.
+        static const uint8_t ret = 0xC3;
+        set_and_record_bytes(t, syms.file_offset(i), &ret, sizeof(ret), start,
+                             size, offset_pages);
+      }
+    }
+  }
 }

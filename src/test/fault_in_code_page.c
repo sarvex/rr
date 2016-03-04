@@ -4,16 +4,17 @@
 
 typedef int (*fn_type)(void);
 static fn_type fn = NULL;
-static const uint8_t fn_insns[] = { 0xb8, 0x2a, 0x00,
-                                    0x00, 0x00, /* movl $42, %eax */
-                                    0xc3,       /* ret */
+static const uint8_t fn_insns[] = {
+  0xb8, 0x2a, 0x00, 0x00, 0x00, /* movl $42, %eax */
+  0xc3,                         /* ret */
 };
 
 static uint8_t* code_page;
 static size_t page_size;
 
 static int fault_count;
-static void fault_in_code_page(int sig, siginfo_t* si, void* context) {
+static void fault_in_code_page(int sig, siginfo_t* si,
+                               __attribute__((unused)) void* context) {
   atomic_printf("FAULT: signal %d: code %d for addr %p\n", sig, si->si_code,
                 si->si_addr);
   test_assert(SIGSEGV == sig);
@@ -44,7 +45,7 @@ static uint64_t sigsegv_blocked_rdtsc(void) {
   return tsc;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   struct sigaction act;
 
   page_size = sysconf(_SC_PAGESIZE);

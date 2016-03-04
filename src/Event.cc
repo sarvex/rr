@@ -18,22 +18,6 @@
 using namespace rr;
 using namespace std;
 
-static const char* desched_state_name(DeschedState state) {
-  switch (state) {
-    case ARMING_DESCHED_EVENT:
-      return "arming";
-    case IN_SYSCALL:
-      return "in-syscall";
-    case DISARMING_DESCHED_EVENT:
-      return "disarming";
-    case DISARMED_DESCHED_EVENT:
-      return "disarmed";
-    default:
-      FATAL() << "Unknown desched state " << state;
-      return nullptr; // not reached
-  }
-}
-
 Event::Event(EncodedEvent e) {
   switch (event_type = e.type) {
     case EV_SEGV_RDTSC:
@@ -43,6 +27,7 @@ Event::Event(EncodedEvent e) {
     case EV_SYSCALLBUF_ABORT_COMMIT:
     case EV_SYSCALLBUF_RESET:
     case EV_PATCH_SYSCALL:
+    case EV_GROW_MAP:
     case EV_TRACE_TERMINATION:
     case EV_UNSTABLE_EXIT:
     case EV_INTERRUPTED_SYSCALL_NOT_RESTARTED:
@@ -54,7 +39,6 @@ Event::Event(EncodedEvent e) {
 
     case EV_DESCHED:
       new (&Desched()) DeschedEvent(nullptr, e.arch());
-      Desched().state = DeschedState(e.data);
       return;
 
     case EV_SIGNAL:
@@ -162,21 +146,13 @@ EncodedEvent Event::encode() const {
     case EV_SYSCALLBUF_ABORT_COMMIT:
     case EV_SYSCALLBUF_RESET:
     case EV_PATCH_SYSCALL:
+    case EV_GROW_MAP:
     case EV_TRACE_TERMINATION:
     case EV_UNSTABLE_EXIT:
     case EV_INTERRUPTED_SYSCALL_NOT_RESTARTED:
     case EV_EXIT_SIGHANDLER:
       // No auxiliary data.
       set_encoded_event_data(&e, 0);
-      return e;
-
-    case EV_DESCHED:
-      // Disarming the desched notification is a transient
-      // state that we shouldn't try to record.
-      assert(DISARMING_DESCHED_EVENT != Desched().state);
-      set_encoded_event_data(&e, IN_SYSCALL == Desched().state
-                                     ? ARMING_DESCHED_EVENT
-                                     : Desched().state);
       return e;
 
     case EV_SIGNAL:
@@ -206,32 +182,17 @@ EncodedEvent Event::encode() const {
   }
 }
 
-HasExecInfo Event::record_exec_info() const {
-  switch (event_type) {
-    case EV_DESCHED: {
-      // By the time the tracee is in the buffered syscall,
-      // it's by definition already armed the desched event.
-      // So we're recording that event ex post facto, and
-      // there's no meaningful execution information.
-      return IN_SYSCALL != Desched().state ? HAS_EXEC_INFO : NO_EXEC_INFO;
-    }
-    default:
-      return Base().has_exec_info;
-  }
-}
+HasExecInfo Event::record_exec_info() const { return Base().has_exec_info; }
 
 bool Event::has_ticks_slop() const {
   switch (type()) {
     case EV_SYSCALLBUF_ABORT_COMMIT:
     case EV_SYSCALLBUF_FLUSH:
     case EV_SYSCALLBUF_RESET:
-      return true;
+    case EV_INTERRUPTED_SYSCALL_NOT_RESTARTED:
     case EV_DESCHED:
-      // ARM_DESCHED events are like the SYSCALLBUF_* events
-      // in that they weren't actually observed during
-      // recording, only inferred, so we don't have any
-      // reference to assert against during replay.
-      return (ARMING_DESCHED_EVENT == Desched().state);
+    case EV_GROW_MAP:
+      return true;
     default:
       return false;
   }
@@ -264,13 +225,6 @@ string Event::str() const {
   stringstream ss;
   ss << type_name();
   switch (event_type) {
-    case EV_DESCHED:
-      ss << ": " << desched_state_name(Desched().state);
-      // This is null during replay.
-      if (Desched().rec) {
-        ss << "; " << Desched().rec->syscallno;
-      }
-      break;
     case EV_SIGNAL:
     case EV_SIGNAL_DELIVERY:
     case EV_SIGNAL_HANDLER:
@@ -327,6 +281,7 @@ std::string Event::type_name() const {
       CASE(SYSCALLBUF_ABORT_COMMIT);
       CASE(SYSCALLBUF_RESET);
       CASE(PATCH_SYSCALL);
+      CASE(GROW_MAP);
       CASE(UNSTABLE_EXIT);
       CASE(DESCHED);
       CASE(SIGNAL);
@@ -341,6 +296,11 @@ std::string Event::type_name() const {
       return nullptr; // not reached
   }
 }
+
+SignalEvent::SignalEvent(const siginfo_t& siginfo, SupportedArch arch)
+    : BaseEvent(HAS_EXEC_INFO, arch),
+      siginfo(siginfo),
+      deterministic(is_deterministic_signal(siginfo)) {}
 
 const char* state_name(SyscallState state) {
   switch (state) {

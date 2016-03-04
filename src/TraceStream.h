@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -14,8 +15,9 @@
 #include "Event.h"
 #include "remote_ptr.h"
 #include "TraceFrame.h"
-#include "TraceMappedRegion.h"
 #include "TraceTaskEvent.h"
+
+class KernelMapping;
 
 /**
  * TraceStream stores all the data common to both recording and
@@ -115,17 +117,16 @@ public:
    */
   void write_frame(const TraceFrame& frame);
 
-  enum RecordInTrace {
-    DONT_RECORD_IN_TRACE,
-    RECORD_IN_TRACE
-  };
+  enum RecordInTrace { DONT_RECORD_IN_TRACE, RECORD_IN_TRACE };
+  enum MappingOrigin { SYSCALL_MAPPING, EXEC_MAPPING, PATCH_MAPPING };
   /**
-   * Write TraceMappedRegion record to the trace.
+   * Write mapped-region record to the trace.
    * If this returns RECORD_IN_TRACE, then the data for the map should be
    * recorded in the trace raw-data.
    */
-  RecordInTrace write_mapped_region(const TraceMappedRegion& map, int prot,
-                                    int flags);
+  RecordInTrace write_mapped_region(const KernelMapping& map,
+                                    const struct stat& stat,
+                                    MappingOrigin origin = SYSCALL_MAPPING);
 
   /**
    * Write a raw-data record to the trace.
@@ -162,6 +163,12 @@ public:
               const std::vector<std::string>& envp, const string& cwd,
               int bind_to_cpu);
 
+  /**
+   * We got far enough into recording that we should set this as the latest
+   * trace.
+   */
+  void make_latest_trace();
+
 private:
   std::string try_hardlink_file(const std::string& file_name);
 
@@ -169,6 +176,11 @@ private:
   const CompressedWriter& writer(Substream s) const { return *writers[s]; }
 
   std::unique_ptr<CompressedWriter> writers[SUBSTREAM_COUNT];
+  /**
+   * Files that have already been mapped without being copied to the trace,
+   * i.e. that we have already assumed to be immutable.
+   */
+  std::set<std::pair<dev_t, ino_t> > files_assumed_immutable;
   uint32_t mmap_count;
 };
 
@@ -192,11 +204,7 @@ public:
    */
   TraceFrame read_frame();
 
-  enum MappedDataSource {
-    SOURCE_TRACE,
-    SOURCE_FILE,
-    SOURCE_ZERO
-  };
+  enum MappedDataSource { SOURCE_TRACE, SOURCE_FILE, SOURCE_ZERO };
   /**
    * Where to obtain data for the mapped region.
    */
@@ -204,14 +212,24 @@ public:
     MappedDataSource source;
     /** Name of file to map the data from. */
     string file_name;
-    /** Data offset in pages within the file. */
-    uint64_t file_data_offset_pages;
+    /** Data offset within the file. */
+    uint64_t file_data_offset_bytes;
+    /** Original size of mapped file. */
+    uint64_t file_size_bytes;
   };
   /**
    * Read the next mapped region descriptor and return it.
    * Also returns where to get the mapped data in 'data'.
+   * If |found| is non-null, set *found to indicate whether a descriptor
+   * was found for the current event.
    */
-  TraceMappedRegion read_mapped_region(MappedData* data);
+  KernelMapping read_mapped_region(MappedData* data, bool* found = nullptr);
+
+  /**
+   * Peek at the next mapping. Returns an empty region if there isn't one for
+   * the current event.
+   */
+  KernelMapping peek_mapped_region();
 
   /**
    * Read a task event (clone or exec record) from the trace.

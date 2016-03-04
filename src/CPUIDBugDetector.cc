@@ -19,7 +19,7 @@ void CPUIDBugDetector::run_detection_code() {
   cpuid_loop(4);
 }
 
-static bool rcb_counts_ok(uint64_t prev, uint64_t current, const char* source) {
+static bool rcb_counts_ok(uint64_t prev, uint64_t current) {
   if (current - prev == 2) {
     return true;
   }
@@ -32,9 +32,9 @@ static bool rcb_counts_ok(uint64_t prev, uint64_t current, const char* source) {
         "instructions\n"
         "    sometimes fails to be counted by the conditional branch "
         "performance\n"
-        "    counter. Partial workarounds have been enabled but replay may "
-        "diverge.\n"
-        "    Consider running rr not in a VMWare guest.\n"
+        "    counter. Work around this problem by adding\n"
+        "        monitor_control.disable_hvsim_clusters = true\n"
+        "    to your .vmx file.\n"
         "\n");
   }
   return false;
@@ -43,7 +43,7 @@ static bool rcb_counts_ok(uint64_t prev, uint64_t current, const char* source) {
 void CPUIDBugDetector::notify_reached_syscall_during_replay(Task* t) {
   // We only care about events that happen before the first exec,
   // when our detection code runs.
-  if (t->session().can_validate()) {
+  if (t->session().done_initial_exec()) {
     return;
   }
   const Event& ev = t->current_trace_frame().event();
@@ -54,10 +54,8 @@ void CPUIDBugDetector::notify_reached_syscall_during_replay(Task* t) {
   uint64_t trace_rcb_count = t->current_trace_frame().ticks();
   uint64_t actual_rcb_count = t->tick_count();
   if (trace_rcb_count_at_last_geteuid32 > 0 && !detected_cpuid_bug) {
-    if (!rcb_counts_ok(trace_rcb_count_at_last_geteuid32, trace_rcb_count,
-                       "trace") ||
-        !rcb_counts_ok(actual_rcb_count_at_last_geteuid32, actual_rcb_count,
-                       "actual")) {
+    if (!rcb_counts_ok(trace_rcb_count_at_last_geteuid32, trace_rcb_count) ||
+        !rcb_counts_ok(actual_rcb_count_at_last_geteuid32, actual_rcb_count)) {
       detected_cpuid_bug = true;
     }
   }

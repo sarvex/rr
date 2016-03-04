@@ -4,17 +4,12 @@
 #define RR_LOG_H
 
 #include <iostream>
+#include <vector>
 
 #include "Flags.h"
 #include "task.h"
 
-enum LogLevel {
-  LOG_fatal,
-  LOG_error,
-  LOG_warn,
-  LOG_info,
-  LOG_debug
-};
+enum LogLevel { LOG_fatal, LOG_error, LOG_warn, LOG_info, LOG_debug };
 
 inline static bool logging_enabled_for(LogLevel level) {
   switch (level) {
@@ -66,6 +61,8 @@ inline static std::ostream& log_stream() {
   return std::cerr;
 #endif
 }
+
+void operator<<(std::ostream& stream, const std::vector<uint8_t>& bytes);
 
 struct NewlineTerminatingOstream {
   NewlineTerminatingOstream(LogLevel level) : level(level) {}

@@ -33,7 +33,8 @@ struct BreakStatus {
         signal(0),
         breakpoint_hit(false),
         singlestep_complete(false),
-        approaching_ticks_target(false) {}
+        approaching_ticks_target(false),
+        task_exit(false) {}
 
   // The triggering Task. This may be different from session->current_task()
   // when replay switches to a new task when ReplaySession::replay_step() ends.
@@ -51,6 +52,13 @@ struct BreakStatus {
   // True when we stopped because we got too close to the specified ticks
   // target.
   bool approaching_ticks_target;
+  // True when we stopped because |task| is about to exit.
+  bool task_exit;
+
+  bool any_break() {
+    return !watchpoints_hit.empty() || signal || breakpoint_hit ||
+           singlestep_complete || approaching_ticks_target;
+  }
 };
 enum RunCommand {
   // Continue until we hit a breakpoint or a new replay event
@@ -62,6 +70,10 @@ enum RunCommand {
   // instruction. Usable with ReplaySession::replay_step only.
   RUN_SINGLESTEP_FAST_FORWARD
 };
+
+inline bool is_singlestep(RunCommand command) {
+  return command == RUN_SINGLESTEP || command == RUN_SINGLESTEP_FAST_FORWARD;
+}
 
 /**
  * Sessions track the global state of a set of tracees corresponding
@@ -99,7 +111,12 @@ public:
    */
   void post_exec();
 
-  bool can_validate() const { return tracees_consistent; }
+  /**
+   * Returns true after the tracee has done the initial exec in Task::spawn.
+   * Before then, tracee state can be inconsistent; from the exec exit-event
+   * onwards, the tracee state much be consistent.
+   */
+  bool done_initial_exec() const { return done_initial_exec_; }
 
   /**
    * Create and return a new address space that's constructed
@@ -114,6 +131,12 @@ public:
    */
   std::shared_ptr<AddressSpace> clone(Task* t,
                                       std::shared_ptr<AddressSpace> vm);
+
+  std::shared_ptr<TaskGroup> create_tg(Task* t);
+  /**
+   * Return a copy of |tg| with the same mappings.
+   */
+  std::shared_ptr<TaskGroup> clone(Task* t, std::shared_ptr<TaskGroup> tg);
 
   /** See Task::clone(). */
   Task* clone(Task* p, int flags, remote_ptr<void> stack, remote_ptr<void> tls,
@@ -159,7 +182,7 @@ public:
 
   /** Return the set of Tasks being tracekd in this session. */
   const TaskMap& tasks() const {
-    assert_fully_initialized();
+    finish_initializing();
     return task_map;
   }
 
@@ -204,15 +227,15 @@ protected:
 
   virtual void on_create(Task* t);
 
-  BreakStatus diagnose_debugger_trap(Task* t);
+  BreakStatus diagnose_debugger_trap(Task* t, RunCommand run_command);
   void check_for_watchpoint_changes(Task* t, BreakStatus& break_status);
 
   void copy_state_to(Session& dest, EmuFs& dest_emu_fs);
 
   struct CloneCompletion;
   // Call this before doing anything that requires access to the full set
-  // of tasks (i.e., almost anything!).
-  void finish_initializing();
+  // of tasks (i.e., almost anything!). Not really const!
+  void finish_initializing() const;
   void assert_fully_initialized() const;
 
   AddressSpaceMap vm_map;
@@ -231,7 +254,7 @@ protected:
    * True if we've done an exec so tracees are now in a state that will be
    * consistent across record and replay.
    */
-  bool tracees_consistent;
+  bool done_initial_exec_;
 
   /**
    * True while the execution of this session is visible to users.

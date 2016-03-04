@@ -23,7 +23,11 @@ static void change_group_fd(int fd, gid_t new_gid) {
   test_assert(0 == fchown(fd, geteuid(), new_gid));
 }
 
-int main(int argc, char* argv[]) {
+static void change_group_at(const char* path, gid_t new_gid) {
+  test_assert(0 == fchownat(AT_FDCWD, path, geteuid(), new_gid, 0));
+}
+
+int main(void) {
   gid_t groups[32];
   int ngroups;
   gid_t this_group, other_group;
@@ -55,6 +59,10 @@ int main(int argc, char* argv[]) {
   change_group_fd(fd, this_group);
   atomic_printf("  ... now back to original owner %d\n", get_gid(fd));
   test_assert(this_group == get_gid(fd));
+
+  change_group_at(DUMMY_FILENAME, other_group);
+  atomic_printf("  ... now owner is %d\n", get_gid(fd));
+  test_assert(other_group == get_gid(fd));
 
   unlink(DUMMY_FILENAME);
 

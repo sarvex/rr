@@ -5,6 +5,7 @@
 #include "TraceStream.h"
 
 #include <inttypes.h>
+#include <limits.h>
 #include <sysexits.h>
 
 #include <fstream>
@@ -25,7 +26,7 @@ using namespace std;
 // MUST increment this version number.  Otherwise users' old traces
 // will become unreplayable and they won't know why.
 //
-#define TRACE_VERSION 26
+#define TRACE_VERSION 41
 
 struct SubstreamData {
   const char* name;
@@ -50,7 +51,45 @@ static TraceStream::Substream operator++(TraceStream::Substream& s) {
   return s;
 }
 
-static string default_rr_trace_dir() { return string(getenv("HOME")) + "/.rr"; }
+static bool dir_exists(const string& dir) {
+  struct stat dummy;
+  return !dir.empty() && stat(dir.c_str(), &dummy) == 0;
+}
+
+static string default_rr_trace_dir() {
+  static string cached_dir;
+
+  if (!cached_dir.empty()) {
+    return cached_dir;
+  }
+
+  string dot_dir;
+  const char* home = getenv("HOME");
+  if (home) {
+    dot_dir = string(home) + "/.rr";
+  }
+  string xdg_dir;
+  const char* xdg_data_home = getenv("XDG_DATA_HOME");
+  if (xdg_data_home) {
+    xdg_dir = string(xdg_data_home) + "/rr";
+  } else if (home) {
+    xdg_dir = string(home) + "/.local/share/rr";
+  }
+
+  // If XDG dir does not exist but ~/.rr does, prefer ~/.rr for backwards
+  // compatibility.
+  if (dir_exists(xdg_dir)) {
+    cached_dir = xdg_dir;
+  } else if (dir_exists(dot_dir)) {
+    cached_dir = dot_dir;
+  } else if (!xdg_dir.empty()) {
+    cached_dir = xdg_dir;
+  } else {
+    cached_dir = "/tmp/rr";
+  }
+
+  return cached_dir;
+}
 
 static string trace_save_dir() {
   const char* output_dir = getenv("_RR_TRACE_DIR");
@@ -61,29 +100,46 @@ static string latest_trace_symlink() {
   return trace_save_dir() + "/latest-trace";
 }
 
+static void ensure_dir(const string& dir, mode_t mode) {
+  string d = dir;
+  while (!d.empty() && d[d.length() - 1] == '/') {
+    d = d.substr(0, d.length() - 1);
+  }
+
+  struct stat st;
+  if (0 > stat(d.c_str(), &st)) {
+    if (errno != ENOENT) {
+      FATAL() << "Error accessing trace directory `" << dir << "'";
+    }
+
+    size_t last_slash = d.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0) {
+      FATAL() << "Can't find trace directory `" << dir << "'";
+    }
+    ensure_dir(d.substr(0, last_slash), mode);
+
+    // Allow for a race condition where someone else creates the directory
+    if (0 > mkdir(d.c_str(), mode) && errno != EEXIST) {
+      FATAL() << "Can't create trace directory `" << dir << "'";
+    }
+    if (0 > stat(d.c_str(), &st)) {
+      FATAL() << "Can't stat trace directory `" << dir << "'";
+    }
+  }
+
+  if (!(S_IFDIR & st.st_mode)) {
+    FATAL() << "`" << dir << "' exists but isn't a directory.";
+  }
+  if (access(d.c_str(), W_OK)) {
+    FATAL() << "Can't write to `" << dir << "'.";
+  }
+}
+
 /**
  * Create the default ~/.rr directory if it doesn't already exist.
  */
 static void ensure_default_rr_trace_dir() {
-  string dir = default_rr_trace_dir();
-  struct stat st;
-  if (0 == stat(dir.c_str(), &st)) {
-    if (!(S_IFDIR & st.st_mode)) {
-      FATAL() << "`" << dir << "' exists but isn't a directory.";
-    }
-    if (access(dir.c_str(), W_OK)) {
-      FATAL() << "Can't write to `" << dir << "'.";
-    }
-    return;
-  }
-  int ret = mkdir(dir.c_str(), S_IRWXU | S_IRWXG);
-  int err = errno;
-  // Another rr process can be concurrently attempting to create
-  // ~/.rr, so the directory may have come into existence since
-  // we checked above.
-  if (ret && EEXIST != err) {
-    FATAL() << "Failed to create directory `" << dir << "'";
-  }
+  ensure_dir(default_rr_trace_dir(), S_IRWXU);
 }
 
 string TraceStream::path(Substream s) {
@@ -113,13 +169,14 @@ struct BasicInfo {
   pid_t tid_;
   EncodedEvent ev;
   Ticks ticks_;
+  double monotonic_sec;
 };
 
 void TraceWriter::write_frame(const TraceFrame& frame) {
   auto& events = writer(EVENTS);
 
-  BasicInfo basic_info = { frame.time(),           frame.tid(),
-                           frame.event().encode(), frame.ticks() };
+  BasicInfo basic_info = { frame.time(), frame.tid(), frame.event().encode(),
+                           frame.ticks(), frame.monotonic_time() };
   events << basic_info;
   if (!events.good()) {
     FATAL() << "Tried to save " << sizeof(basic_info)
@@ -164,7 +221,8 @@ TraceFrame TraceReader::read_frame() {
   BasicInfo basic_info;
   events >> basic_info;
   TraceFrame frame(basic_info.global_time, basic_info.tid_,
-                   Event(basic_info.ev), basic_info.ticks_);
+                   Event(basic_info.ev), basic_info.ticks_,
+                   basic_info.monotonic_sec);
   if (frame.event().has_exec_info() == HAS_EXEC_INFO) {
     events >> frame.recorded_regs >> frame.extra_perf;
 
@@ -240,15 +298,14 @@ TraceTaskEvent TraceReader::read_task_event() {
 }
 
 string TraceWriter::try_hardlink_file(const string& file_name) {
-  char link_name[] = "mmap_XXXXXXXXX_hardlink";
-  sprintf(link_name, "mmap_%d_hardlink", mmap_count);
+  char count_str[20];
+  sprintf(count_str, "%d", mmap_count);
 
   size_t last_slash = file_name.rfind('/');
   string basename = (last_slash != file_name.npos)
                         ? file_name.substr(last_slash + 1)
                         : file_name;
-
-  string link_path = dir() + "/" + link_name + "_" + basename;
+  string link_path = dir() + "/mmap_" + count_str + "_hardlink_" + basename;
   int ret = link(file_name.c_str(), link_path.c_str());
   if (ret < 0) {
     // maybe tried to link across filesystems?
@@ -258,68 +315,95 @@ string TraceWriter::try_hardlink_file(const string& file_name) {
 }
 
 TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
-    const TraceMappedRegion& map, int prot, int flags) {
+    const KernelMapping& km, const struct stat& stat, MappingOrigin origin) {
   auto& mmaps = writer(MMAPS);
   TraceReader::MappedDataSource source;
   string backing_file_name;
-  if (map.type() == TraceMappedRegion::SYSV_SHM) {
+  if (km.fsname().find("/SYSV") == 0) {
     source = TraceReader::SOURCE_TRACE;
-  } else if (map.stat().st_ino == 0) {
+  } else if (origin == SYSCALL_MAPPING &&
+             (km.inode() == 0 || km.fsname() == "/dev/zero (deleted)")) {
     source = TraceReader::SOURCE_ZERO;
+  } else if (should_copy_mmap_region(km, stat) &&
+             files_assumed_immutable.find(make_pair(
+                 stat.st_dev, stat.st_ino)) == files_assumed_immutable.end()) {
+    source = TraceReader::SOURCE_TRACE;
   } else {
-    if (should_copy_mmap_region(map.file_name(), &map.stat(), prot, flags)) {
-      source = TraceReader::SOURCE_TRACE;
-    } else {
-      source = TraceReader::SOURCE_FILE;
-      // Try hardlinking file into the trace directory. This will avoid
-      // replay failures if the original file is deleted or replaced (but not
-      // if it is overwritten in-place). If try_hardlink_file fails it
-      // just returns the original file name.
-      // A relative backing_file_name is relative to the trace directory.
-      backing_file_name = try_hardlink_file(map.file_name());
-    }
+    source = TraceReader::SOURCE_FILE;
+    // Try hardlinking file into the trace directory. This will avoid
+    // replay failures if the original file is deleted or replaced (but not
+    // if it is overwritten in-place). If try_hardlink_file fails it
+    // just returns the original file name.
+    // A relative backing_file_name is relative to the trace directory.
+    backing_file_name = try_hardlink_file(km.fsname());
+    files_assumed_immutable.insert(make_pair(stat.st_dev, stat.st_ino));
   }
-  mmaps << source << map.type() << map.file_name() << map.stat() << map.start()
-        << map.end() << map.offset_pages() << backing_file_name;
+  mmaps << global_time << source << km.start() << km.end() << km.fsname()
+        << km.device() << km.inode() << km.prot() << km.flags()
+        << km.file_offset_bytes() << backing_file_name << (uint32_t)stat.st_mode
+        << (uint32_t)stat.st_uid << (uint32_t)stat.st_gid
+        << (int64_t)stat.st_size << (int64_t)stat.st_mtime;
   ++mmap_count;
   return source == TraceReader::SOURCE_TRACE ? RECORD_IN_TRACE
                                              : DONT_RECORD_IN_TRACE;
 }
 
-static void verify_backing_file(const TraceMappedRegion& map,
-                                const string& backing_file_name) {
-  struct stat backing_stat;
-  if (stat(backing_file_name.c_str(), &backing_stat)) {
-    FATAL() << "Failed to stat " << backing_file_name
-            << ": replay is impossible";
+KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found) {
+  if (found) {
+    *found = false;
   }
-  if (backing_stat.st_ino != map.stat().st_ino ||
-      backing_stat.st_mode != map.stat().st_mode ||
-      backing_stat.st_uid != map.stat().st_uid ||
-      backing_stat.st_gid != map.stat().st_gid ||
-      backing_stat.st_size != map.stat().st_size ||
-      backing_stat.st_mtime != map.stat().st_mtime) {
-    LOG(error)
-        << "Metadata of " << map.file_name()
-        << " changed: replay divergence likely, but continuing anyway ...";
-  }
-}
 
-TraceMappedRegion TraceReader::read_mapped_region(MappedData* data) {
   auto& mmaps = reader(MMAPS);
-  TraceMappedRegion map;
+  if (mmaps.at_end()) {
+    return KernelMapping();
+  }
+
+  mmaps.save_state();
+  TraceFrame::Time time;
+  mmaps >> time;
+  mmaps.restore_state();
+  if (time != global_time) {
+    return KernelMapping();
+  }
+
+  string original_file_name;
   string backing_file_name;
-  mmaps >> data->source >> map.type_ >> map.filename >> map.stat_ >>
-      map.start_ >> map.end_ >> map.file_offset_pages >> backing_file_name;
+  remote_ptr<void> start, end;
+  dev_t device;
+  ino_t inode;
+  int prot, flags;
+  uint32_t uid, gid, mode;
+  uint64_t file_offset_bytes;
+  int64_t mtime, file_size;
+  mmaps >> time >> data->source >> start >> end >> original_file_name >>
+      device >> inode >> prot >> flags >> file_offset_bytes >>
+      backing_file_name >> mode >> uid >> gid >> file_size >> mtime;
+  assert(time == global_time);
   if (data->source == SOURCE_FILE) {
     if (backing_file_name[0] != '/') {
       backing_file_name = dir() + "/" + backing_file_name;
     }
-    data->file_name = backing_file_name;
-    data->file_data_offset_pages = map.file_offset_pages;
-    verify_backing_file(map, backing_file_name);
+    struct stat backing_stat;
+    if (stat(backing_file_name.c_str(), &backing_stat)) {
+      FATAL() << "Failed to stat " << backing_file_name
+              << ": replay is impossible";
+    }
+    if (backing_stat.st_ino != inode || backing_stat.st_mode != mode ||
+        backing_stat.st_uid != uid || backing_stat.st_gid != gid ||
+        backing_stat.st_size != file_size || backing_stat.st_mtime != mtime) {
+      LOG(error)
+          << "Metadata of " << original_file_name
+          << " changed: replay divergence likely, but continuing anyway ...";
+    }
   }
-  return map;
+  data->file_name = backing_file_name;
+  data->file_data_offset_bytes = file_offset_bytes;
+  data->file_size_bytes = file_size;
+  if (found) {
+    *found = true;
+  }
+  return KernelMapping(start, end, original_file_name, device, inode, prot,
+                       flags, file_offset_bytes);
 }
 
 static ostream& operator<<(ostream& out, const vector<string>& vs) {
@@ -364,20 +448,19 @@ TraceReader::RawData TraceReader::read_raw_data() {
 
 bool TraceReader::read_raw_data_for_frame(const TraceFrame& frame, RawData& d) {
   auto& data_header = reader(RAW_DATA_HEADER);
-  while (!data_header.at_end()) {
-    TraceFrame::Time time;
-    data_header.save_state();
-    data_header >> time;
-    data_header.restore_state();
-    if (time == frame.time()) {
-      d = read_raw_data();
-      return true;
-    }
-    if (time > frame.time()) {
-      return false;
-    }
+  if (data_header.at_end()) {
+    return false;
   }
-  return false;
+  TraceFrame::Time time;
+  data_header.save_state();
+  data_header >> time;
+  data_header.restore_state();
+  assert(time >= frame.time());
+  if (time > frame.time()) {
+    return false;
+  }
+  d = read_raw_data();
+  return true;
 }
 
 void TraceWriter::close() {
@@ -413,7 +496,8 @@ TraceWriter::TraceWriter(const vector<string>& argv, const vector<string>& envp,
     : TraceStream(make_trace_dir(argv[0]),
                   // Somewhat arbitrarily start the
                   // global time from 1.
-                  1) {
+                  1),
+      mmap_count(0) {
   this->argv = argv;
   this->envp = envp;
   this->cwd = cwd;
@@ -431,6 +515,20 @@ TraceWriter::TraceWriter(const vector<string>& argv, const vector<string>& envp,
   }
   version << TRACE_VERSION << endl;
 
+  if (!probably_not_interactive(STDOUT_FILENO)) {
+    printf("rr: Saving the execution of `%s' to trace directory `%s'.\n",
+           argv[0].c_str(), trace_dir.c_str());
+  }
+
+  ofstream out(args_env_path());
+  out << cwd << '\0';
+  out << argv;
+  out << envp;
+  out << bind_to_cpu;
+  assert(out.good());
+}
+
+void TraceWriter::make_latest_trace() {
   string link_name = latest_trace_symlink();
   // Try to update the symlink to |this|.  We only try attempt
   // to set the symlink once.  If the link is re-created after
@@ -443,18 +541,6 @@ TraceWriter::TraceWriter(const vector<string>& argv, const vector<string>& envp,
     FATAL() << "Failed to update symlink `" << link_name << "' to `"
             << trace_dir << "'.";
   }
-
-  if (!probably_not_interactive(STDOUT_FILENO)) {
-    printf("rr: Saving the execution of `%s' to trace directory `%s'.\n",
-           argv[0].c_str(), trace_dir.c_str());
-  }
-
-  ofstream out(args_env_path());
-  out << cwd << '\0';
-  out << argv;
-  out << envp;
-  out << bind_to_cpu;
-  assert(out.good());
 }
 
 TraceFrame TraceReader::peek_frame() {

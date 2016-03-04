@@ -59,15 +59,13 @@ public:
   Ticks read_ticks();
 
   /**
-   * Return the fd we are using to monitor the ticks counter.
+   * Return the fd we last used to monitor the ticks counter.
    */
-  int ticks_fd() const { return fd_ticks; }
+  int ticks_fd() const { return fd_ticks.get(); }
 
   /* This choice is fairly arbitrary; linux doesn't use SIGSTKFLT so we
    * hope that tracees don't either. */
-  enum {
-    TIME_SLICE_SIGNAL = SIGSTKFLT
-  };
+  enum { TIME_SLICE_SIGNAL = SIGSTKFLT };
 
   struct Extra {
     Extra() : page_faults(0), hw_interrupts(0), instructions_retired(0) {}

@@ -4,14 +4,14 @@
 
 static int signals_unblocked;
 
-static void handle_usr1(int sig) {
+static void handle_usr1(__attribute__((unused)) int sig) {
   atomic_puts("Caught usr1");
   test_assert(signals_unblocked);
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   sigset_t mask, oldmask;
-  int i, dummy;
+  int i, dummy = 0;
 
   signal(SIGUSR1, handle_usr1);
 

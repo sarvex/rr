@@ -43,7 +43,8 @@ enum CpuMicroarch {
   IntelSandyBridge,
   IntelIvyBridge,
   IntelHaswell,
-  IntelBroadwell
+  IntelBroadwell,
+  IntelSkylake
 };
 
 struct PmuConfig {
@@ -56,21 +57,18 @@ struct PmuConfig {
 };
 
 // XXX please only edit this if you really know what you're doing.
-static const PmuConfig
-pmu_configs[] = { { IntelBroadwell, "Intel Broadwell", 0x5101c4,
-                    0x5100c0,       0x5301cb,          true },
-                  { IntelHaswell, "Intel Haswell", 0x5101c4,
-                    0x5100c0,     0x5301cb,        true },
-                  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4,
-                    0x5100c0,       0x5301cb,           true },
-                  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4,
-                    0x5100c0,         0x5301cb,             true },
-                  { IntelNehalem, "Intel Nehalem", 0x5101c4,
-                    0x5100c0,     0x50011d,        true },
-                  { IntelWestmere, "Intel Westmere", 0x5101c4,
-                    0x5100c0,      0x50011d,         true },
-                  { IntelPenryn, "Intel Penryn", 0, 0, 0, false },
-                  { IntelMerom, "Intel Merom", 0, 0, 0, false }, };
+static const PmuConfig pmu_configs[] = {
+  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5100c0, 0x5301cb, true },
+  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5100c0, 0x5301cb, true },
+  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5100c0, 0x5301cb, true },
+  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, true },
+  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5100c0, 0x5301cb,
+    true },
+  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x5100c0, 0x50011d, true },
+  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x5100c0, 0x50011d, true },
+  { IntelPenryn, "Intel Penryn", 0, 0, 0, false },
+  { IntelMerom, "Intel Merom", 0, 0, 0, false },
+};
 
 static string lowercase(const string& s) {
   string c = s;
@@ -121,6 +119,7 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x306A0:
       return IntelIvyBridge;
     case 0x306C0:
+    case 0x306F0:
     case 0x40650:
     case 0x40660:
       return IntelHaswell;
@@ -128,6 +127,8 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x406F0:
     case 0x50660:
       return IntelBroadwell;
+    case 0x506e0:
+      return IntelSkylake;
     default:
       FATAL() << "CPU " << HEX(cpu_type) << " unknown.";
       return UnknownCpu; // not reached
@@ -186,6 +187,14 @@ static ScopedFd start_counter(pid_t tid, int group_fd,
                               struct perf_event_attr* attr) {
   int fd = syscall(__NR_perf_event_open, attr, tid, -1, group_fd, 0);
   if (0 > fd) {
+    if (errno == EACCES) {
+      FATAL() << "Permission denied to use 'perf_event_open'; are perf events "
+                 "enabled? Try 'perf record'.";
+    }
+    if (errno == ENOENT) {
+      FATAL() << "Unable to open performance counter with 'perf_event_open'; "
+                 "are perf events enabled? Try 'perf record'.";
+    }
     FATAL() << "Failed to initialize counter";
   }
   if (ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)) {
@@ -195,6 +204,8 @@ static ScopedFd start_counter(pid_t tid, int group_fd,
 }
 
 void PerfCounters::reset(Ticks ticks_period) {
+  assert(ticks_period >= 0);
+
   stop();
 
   struct perf_event_attr attr = ticks_attr;

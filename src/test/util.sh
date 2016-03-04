@@ -70,7 +70,7 @@ function onexit {
     if [[ "$leave_data" != "y" ]]; then
         rm -rf $workdir
     else
-        echo Test $TESTNAME failed, leaving behind $workdir.
+        echo Test $TESTNAME failed, leaving behind $workdir
         echo To replay the failed test, run
         echo " " _RR_TRACE_DIR="$workdir" rr replay
     fi
@@ -99,13 +99,17 @@ GLOBAL_OPTIONS="$DEFAULT_FLAGS"
 GLOBAL_OPTIONS_BIND_CPU="$DEFAULT_FLAGS"
 
 LIB_ARG=$1
-OBJDIR=$2
+SRCDIR=$2
+if [[ ! -d "$SRCDIR" ]]; then
+    fatal "FAILED: srcdir missing"
+fi
+OBJDIR=$3
 if [[ "$OBJDIR" == "" ]]; then
     # Default to assuming that the user's working directory is the
     # test/ directory within the rr clone.
     OBJDIR=`realpath ../../../obj`
 fi
-TESTNAME=$3
+TESTNAME=$4
 if [[ "$TESTNAME" == "" ]]; then
     [[ $0 =~ ([A-Za-z0-9_]+)\.run$ ]] || fatal "FAILED: bad test script name"
     TESTNAME=${BASH_REMATCH[1]}
@@ -126,7 +130,6 @@ leave_data=n
 nonce=
 
 # Set up the environment and working directory.
-SRCDIR="${OBJDIR}/../rr"
 TESTDIR="${SRCDIR}/src/test"
 
 export PATH="${OBJDIR}/bin:${PATH}"
@@ -144,6 +147,9 @@ fi
 if [[ ! -d $TESTDIR ]]; then
     fatal FAILED: TESTDIR "($TESTDIR)" not found.
 fi
+
+# Our test programs intentionally crash a lot. Don't generate coredumps for them.
+ulimit -c 0
 
 # NB: must set up the trap handler *before* mktemp
 trap onexit EXIT
@@ -186,7 +192,7 @@ function skip_if_syscall_buf {
 
 function just_record { exe=$1; exeargs=$2;
     _RR_TRACE_DIR="$workdir" \
-        rr $GLOBAL_OPTIONS record $LIB_ARG $RECORD_ARGS $exe $exeargs 1> record.out
+        rr $GLOBAL_OPTIONS record $LIB_ARG $RECORD_ARGS $exe $exeargs 1> record.out 2> record.err
 }
 
 function save_exe { exe=$1;
@@ -242,19 +248,32 @@ function passed {
 # output match; (iii) the supplied token was found in the output.
 # Otherwise the test fails.
 function check { token=$1;
-    if [ ! -f record.out -o ! -f replay.err -o ! -f replay.out ]; then
+    if [ ! -f record.out -o ! -f replay.err -o ! -f replay.out -o ! -f record.err ]; then
         failed "output files not found."
+    elif [[ $(cat record.err) != "" ]]; then
+        failed ": error during recording:"
+        echo "--------------------------------------------------"
+        cat record.err
+        echo "--------------------------------------------------"
+        echo "record.out:"
+        echo "--------------------------------------------------"
+        cat record.out
+        echo "--------------------------------------------------"
     elif [[ $(cat replay.err) != "" ]]; then
         failed ": error during replay:"
         echo "--------------------------------------------------"
         cat replay.err
+        echo "--------------------------------------------------"
+        echo "replay.out:"
+        echo "--------------------------------------------------"
+        cat replay.out
         echo "--------------------------------------------------"
     elif [[ $(diff record.out replay.out) != "" ]]; then
         failed ": output from recording different than replay"
         echo "diff -U8 $workdir/record.out $workdir/replay.out"
         diff -U8 record.out replay.out
     elif [[ "$token" != "" && "record.out" != $(grep -l "$token" record.out) ]]; then
-        failed ": token '$token' not in output:"
+        failed ": token '$token' not in record.out:"
         echo "--------------------------------------------------"
         cat record.out
         echo "--------------------------------------------------"

@@ -59,35 +59,64 @@ class AssemblyTemplate(object):
         return bytes
 
 templates = {
-    'X86VsyscallImplementation': AssemblyTemplate(
+    'X86SysenterVsyscallImplementation': AssemblyTemplate(
         RawBytes(0x51),         # push %ecx
         RawBytes(0x52),         # push %edx
         RawBytes(0x55),         # push %ebp
-        RawBytes(0x89, 0xe5),   # mov %esp, %ebp
+        RawBytes(0x89, 0xe5),   # mov %esp,%ebp
         RawBytes(0x0f, 0x34),   # sysenter
-        RawBytes(0x90),         # nop
-        RawBytes(0x90),         # nop
-        RawBytes(0x90),         # nop
-        RawBytes(0x90),         # nop
-        RawBytes(0x90),         # nop
-        RawBytes(0x90),         # nop
-        RawBytes(0x90),         # nop
+    ),
+    'X86SysenterVsyscallUseInt80': AssemblyTemplate(
         RawBytes(0xcd, 0x80),   # int $0x80
-        RawBytes(0x5d),         # pop %ebp
-        RawBytes(0x5a),         # pop %edx
-        RawBytes(0x59),         # pop %ecx
         RawBytes(0xc3),         # ret
     ),
-    'X86VsyscallMonkeypatch': AssemblyTemplate(
+    'X86SysenterVsyscallSyscallHook': AssemblyTemplate(
         RawBytes(0xe9),         # jmp $syscall_hook_trampoline
         Field('syscall_hook_trampoline', 4),
     ),
-    'X86CallMonkeypatch': AssemblyTemplate(
-        RawBytes(0xe8),         # call $relative_addr
+    'X86VsyscallMonkeypatch': AssemblyTemplate(
+        RawBytes(0x53),         # push %ebx
+        RawBytes(0xb8),         # mov $syscall_number,%eax
+        Field('syscall_number', 4),
+        # __vdso functions use the C calling convention, so
+        # we have to set up the syscall parameters here.
+        # No x86-32 __vdso functions take more than two parameters.
+        RawBytes(0x8b, 0x5c, 0x24, 0x08), # mov 0x8(%esp),%ebx
+        RawBytes(0x8b, 0x4c, 0x24, 0x0c), # mov 0xc(%esp),%ecx
+        RawBytes(0xcd, 0x80),   # int $0x80
+        # pad with NOPs to make room to dynamically patch the syscall
+        # with a call to the preload library, once syscall buffering
+        # has been initialized.
+        RawBytes(0x90),         # nop
+        RawBytes(0x90),         # nop
+        RawBytes(0x90),         # nop
+        RawBytes(0x5b),         # pop %ebx
+        RawBytes(0xc3),         # ret
+    ),
+    'X86SyscallStubExtendedJump': AssemblyTemplate(
+        RawBytes(0xe9), # jmp
+        Field('relative_jump_target', 4),
+    ),
+    'X86SyscallStubMonkeypatch': AssemblyTemplate(
+        # This code must match the stubs in syscall_hook.S.
+        # We must adjust the stack pointer without modifying flags,
+        # at least on the return path.
+        RawBytes(0xc7, 0x84, 0x24, 0x00, 0xff, 0xff, 0xff), # movq $fake_return_addr,-256(%esp)
+        Field('fake_return_addr', 4),
+        RawBytes(0x89, 0xa4, 0x24, 0x04, 0xff, 0xff, 0xff), # mov %esp,-252(%esp)
+        RawBytes(0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # lea -256(%esp),%esp
+        RawBytes(0xe8),         # call $trampoline_relative_addr
+        Field('trampoline_relative_addr', 4),
+        RawBytes(0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00), # lea 256(%esp),%esp
+        RawBytes(0xff, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # jmp -256(%esp)
+    ),
+
+    'X64JumpMonkeypatch': AssemblyTemplate(
+        RawBytes(0xe9),         # jmp $relative_addr
         Field('relative_addr', 4),
     ),
     'X64VsyscallMonkeypatch': AssemblyTemplate(
-        RawBytes(0xb8),         # mov $syscall_number, %eax
+        RawBytes(0xb8),         # mov $syscall_number,%eax
         Field('syscall_number', 4),
         RawBytes(0x0f, 0x05),   # syscall
         # pad with NOPs to make room to dynamically patch the syscall
@@ -97,6 +126,25 @@ templates = {
         RawBytes(0x90),         # nop
         RawBytes(0x90),         # nop
         RawBytes(0xc3),         # ret
+    ),
+    'X64SyscallStubExtendedJump': AssemblyTemplate(
+        RawBytes(0xff, 0x25, 0x00, 0x00, 0x00, 0x00), # jmp *0(%rip)
+        Field('jump_target', 8),
+    ),
+    'X64SyscallStubMonkeypatch': AssemblyTemplate(
+        # This code must match the stubs in syscall_hook.S.
+        # We must adjust the stack pointer without modifying flags,
+        # at least on the return path.
+        RawBytes(0xc7, 0x84, 0x24, 0x00, 0xff, 0xff, 0xff), # movl $return_addr_lo,-256(%rsp)
+        Field('return_addr_lo', 4),
+        RawBytes(0xc7, 0x84, 0x24, 0x04, 0xff, 0xff, 0xff), # movl $return_addr_hi,-252(%rsp)
+        Field('return_addr_hi', 4),
+        RawBytes(0x48, 0x89, 0xa4, 0x24, 0x08, 0xff, 0xff, 0xff), # mov %rsp,-248(%rsp)
+        RawBytes(0x48, 0x8d, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # lea -256(%rsp),%rsp
+        RawBytes(0xe8),         # call $trampoline_relative_addr
+        Field('trampoline_relative_addr', 4),
+        RawBytes(0x48, 0x8d, 0xa4, 0x24, 0x00, 0x01, 0x00, 0x00), # lea 256(%rsp),%rsp
+        RawBytes(0xff, 0xa4, 0x24, 0x00, 0xff, 0xff, 0xff), # jmp -256(%rsp)
     ),
 }
 

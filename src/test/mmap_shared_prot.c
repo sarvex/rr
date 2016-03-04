@@ -4,10 +4,14 @@
 
 static void breakpoint(void) {}
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pid_t child;
   int status;
   char* p;
+
+  /* Do a dummy waitpid so the real one doesn't go through the linker,
+     patching etc */
+  waitpid(-2, NULL, 0);
 
   p = mmap(NULL, PAGE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
            -1, 0);

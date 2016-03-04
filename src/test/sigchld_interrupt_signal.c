@@ -2,9 +2,9 @@
 
 #include "rrutil.h"
 
-int main(int argc, char* argv[]) {
+int main(void) {
   pid_t c;
-  int dummy, i;
+  int dummy = 0, i;
   int status;
 
   atomic_puts("forking child");

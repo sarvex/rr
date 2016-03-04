@@ -3,6 +3,7 @@
 #ifndef RR_PRELOAD_INTERFACE_H_
 #define RR_PRELOAD_INTERFACE_H_
 
+#include <signal.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -25,9 +26,11 @@
 #define SYSCALLBUF_LIB_FILENAME_PADDED SYSCALLBUF_LIB_FILENAME_BASE ".so:::"
 #define SYSCALLBUF_LIB_FILENAME_32 SYSCALLBUF_LIB_FILENAME_BASE "_32.so"
 
-/* This is pretty arbitrary; SIGSYS is unused by linux, and hopefully
- * normal applications don't use it either. */
-#define SYSCALLBUF_DESCHED_SIGNAL SIGSYS
+/* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
+ * power failure, and it's unlikely rr will be recording that.
+ * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
+ * so we can't use it. */
+#define SYSCALLBUF_DESCHED_SIGNAL SIGPWR
 
 /* This size counts the header along with record data. */
 #define SYSCALLBUF_BUFFER_SIZE (1 << 20)
@@ -41,8 +44,24 @@
 #define SYSCALLBUF_FDS_DISABLED_SIZE 1024
 
 #define RR_PAGE_ADDR 0x70000000
-#define RR_PAGE_IN_UNTRACED_SYSCALL_ADDR (RR_PAGE_ADDR + 4)
-#define RR_PAGE_IN_TRACED_SYSCALL_ADDR (RR_PAGE_ADDR + 16)
+#define RR_PAGE_SYSCALL_STUB_SIZE 3
+#define RR_PAGE_SYSCALL_INSTRUCTION_END 2
+#define RR_PAGE_IN_TRACED_SYSCALL_ADDR                                         \
+  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_INSTRUCTION_END)
+#define RR_PAGE_IN_PRIVILEGED_TRACED_SYSCALL_ADDR                              \
+  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE + RR_PAGE_SYSCALL_INSTRUCTION_END)
+#define RR_PAGE_IN_UNTRACED_REPLAYED_SYSCALL_ADDR                              \
+  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 2 +                              \
+   RR_PAGE_SYSCALL_INSTRUCTION_END)
+#define RR_PAGE_IN_UNTRACED_SYSCALL_ADDR                                       \
+  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 3 +                              \
+   RR_PAGE_SYSCALL_INSTRUCTION_END)
+#define RR_PAGE_IN_PRIVILEGED_UNTRACED_SYSCALL_ADDR                            \
+  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 4 +                              \
+   RR_PAGE_SYSCALL_INSTRUCTION_END)
+#define RR_PAGE_FF_BYTES                                                       \
+  (RR_PAGE_ADDR + RR_PAGE_SYSCALL_STUB_SIZE * 5 +                              \
+   RR_PAGE_SYSCALL_INSTRUCTION_END)
 
 /* "Magic" (rr-implemented) syscalls that we use to initialize the
  * syscallbuf.
@@ -65,6 +84,8 @@
 /**
  * The preload library calls SYS_rrcall_notify_syscall_hook_exit when
  * unlocking the syscallbuf and notify_after_syscall_hook_exit has been set.
+ * The word at 4/8(sp) is returned in the syscall result and the word at
+ * 8/16(sp) is stored in original_syscallno.
  */
 #define SYS_rrcall_notify_syscall_hook_exit 444
 
@@ -110,8 +131,21 @@ struct rrcall_init_preload_params {
   int syscall_patch_hook_count;
   PTR(struct syscall_patch_hook) syscall_patch_hooks;
   PTR(void) syscall_hook_trampoline;
+  PTR(void) syscall_hook_stub_buffer;
+  PTR(void) syscall_hook_stub_buffer_end;
   /* Array of size SYSCALLBUF_FDS_DISABLED_SIZE */
   PTR(volatile char) syscallbuf_fds_disabled;
+  /* Address of the flag which is 0 during recording and 1 during replay. */
+  PTR(unsigned char) in_replay_flag;
+  /* Address where we store the number of cores we're pretending to have. */
+  PTR(int) pretend_num_cores;
+  /* Address of the first entry of the breakpoint table.
+   * After processing a sycallbuf record (and unlocking the syscallbuf),
+   * we call a function in this table corresponding to the record processed.
+   * rr can set a breakpoint in this table to break on the completion of a
+   * particular syscallbuf record. */
+  PTR(void) breakpoint_table;
+  int breakpoint_table_entry_size;
 };
 
 /**
@@ -123,6 +157,10 @@ TEMPLATE_ARCH
 struct rrcall_init_buffers_params {
   /* The fd we're using to track desched events. */
   int desched_counter_fd;
+  /* padding for 64-bit archs. Structs written to tracee memory must not have
+   * holes!
+   */
+  int padding;
 
   /* "Out" params. */
   /* Returned pointer to and size of the shared syscallbuf
@@ -163,7 +201,7 @@ struct syscallbuf_record {
   uint32_t size;
   /* Extra recorded outparam data starts here. */
   uint8_t extra_data[0];
-} __attribute__((__packed__));
+};
 
 /**
  * This struct summarizes the state of the syscall buffer.  It happens
@@ -171,16 +209,17 @@ struct syscallbuf_record {
  */
 struct syscallbuf_hdr {
   /* The number of valid syscallbuf_record bytes in the buffer,
-   * not counting this header. */
-  uint32_t num_rec_bytes;
+   * not counting this header.
+   * Make this volatile so that memory writes aren't reordered around
+   * updates to this field. */
+  volatile uint32_t num_rec_bytes;
   /* True if the current syscall should not be committed to the
    * buffer, for whatever reason; likely interrupted by
    * desched. Set by rr. */
   uint8_t abort_commit;
   /* True if, next time we exit the syscall buffer hook, libpreload should
    * execute SYS_rrcall_notify_syscall_hook_exit to give rr the opportunity to
-   * deliver a signal.
-   */
+   * deliver a signal and/or reset the syscallbuf. */
   uint8_t notify_on_syscall_hook_exit;
   /* This tracks whether the buffer is currently in use for a
    * system call. This is helpful when a signal handler runs
@@ -213,8 +252,8 @@ inline static struct syscallbuf_record* next_record(
  * the buffer if committed, including padding.
  */
 inline static long stored_record_size(size_t length) {
-  /* Round up to a whole number of 32-bit words. */
-  return (length + sizeof(int) - 1) & ~(sizeof(int) - 1);
+  /* Round up to a whole number of 64-bit words. */
+  return (length + 7) & ~7;
 }
 
 /**
@@ -229,9 +268,21 @@ inline static long stored_record_size(size_t length) {
  * too much by piling on.
  */
 inline static int is_blacklisted_filename(const char* filename) {
-  return (!strcmp("/dev/dri/card0", filename) ||
-          !strcmp("/dev/nvidiactl", filename) ||
-          !strcmp("/usr/share/alsa/alsa.conf", filename));
+  return !strncmp("/dev/dri/", filename, 9) ||
+         !strcmp("/dev/nvidiactl", filename) ||
+         !strcmp("/usr/share/alsa/alsa.conf", filename);
+}
+
+inline static int is_dev_tty(const char* filename) {
+  return !strcmp("/dev/tty", filename);
+}
+
+/**
+ * Returns nonzero if an attempted open() of |filename| can be syscall-buffered.
+ * When this returns zero, the open must be forwarded to the rr process.
+ */
+inline static int allow_buffered_open(const char* filename) {
+  return !is_blacklisted_filename(filename) && !is_dev_tty(filename);
 }
 
 #endif /* RR_PRELOAD_INTERFACE_H_ */

@@ -14,8 +14,8 @@ pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 
 static void fin_intr_sleep(int secs) {
-  struct timespec req = { .tv_sec = secs };
-  struct timespec rem = { .tv_sec = -1, .tv_nsec = -1 };
+  struct timespec req = {.tv_sec = secs };
+  struct timespec rem = {.tv_sec = -1, .tv_nsec = -1 };
 
   test_assert(0 == nanosleep(&req, &rem));
   /* We would normally assert that the outparam wasn't touched
@@ -55,7 +55,7 @@ static void cond_wait(int secs) {
   test_assert(ETIMEDOUT == pthread_cond_timedwait(&cond, &lock, &ts));
 }
 
-static void* reader_thread(void* dontcare) {
+static void* reader_thread(__attribute__((unused)) void* dontcare) {
   char token = start_token;
   int readsock = sockfds[1];
   char c = sentinel_token;
@@ -81,7 +81,7 @@ static void* reader_thread(void* dontcare) {
   return NULL;
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   char token = start_token;
   struct timeval ts;
   int i;

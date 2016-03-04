@@ -3,6 +3,8 @@
 #ifndef RR_KERNEL_SUPPLEMENT_H_
 #define RR_KERNEL_SUPPLEMENT_H_
 
+#include <linux/mman.h>
+#include <linux/seccomp.h>
 #include <sys/ptrace.h>
 
 /* Definitions that should be part of system headers (and maybe are on some but
@@ -34,6 +36,10 @@
 #define SECCOMP_SET_MODE_FILTER 1
 #endif
 
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
+
 // These are defined by the include/linux/errno.h in the kernel tree.
 // Since userspace doesn't see these errnos in normal operation, that
 // header apparently isn't distributed with libc.
@@ -55,5 +61,23 @@
  * manipulate sigsets. */
 typedef uint64_t sig_set_t;
 static_assert(_NSIG / 8 == sizeof(sig_set_t), "Update sig_set_t for _NSIG.");
+
+#ifndef MADV_DONTDUMP
+#define MADV_DONTDUMP 16
+#endif
+#ifndef MADV_DODUMP
+#define MADV_DODUMP 17
+#endif
+#ifndef MADV_SOFT_OFFLINE
+#define MADV_SOFT_OFFLINE 101
+#endif
+
+#ifndef BUS_MCEERR_AR
+#define BUS_MCEERR_AR 4
+#endif
+
+#ifndef BUS_MCEERR_AO
+#define BUS_MCEERR_AO 5
+#endif
 
 #endif /* RR_KERNEL_SUPPLEMENT_H_ */

@@ -8,8 +8,8 @@ static void handle_segv(int sig) {
   exit(0);
 }
 
-int main(int argc, char* argv[]) {
-  int dummy, i;
+int main(void) {
+  int dummy = 0, i;
 
   signal(SIGSEGV, handle_segv);
 

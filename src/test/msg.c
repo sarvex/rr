@@ -21,7 +21,8 @@ static void child(void) {
   int i;
   int ret;
   int err;
-  struct msg msg = { 0 };
+  struct msg msg;
+  memset(&msg, 0, sizeof(msg));
 
   atomic_printf("%s: inherited msg id %d\n", id, msqid);
   test_assert(msqid >= 0);
@@ -46,7 +47,7 @@ static void child(void) {
   exit(0);
 }
 
-int main(int argc, char* argv[]) {
+int main(void) {
   const char* id = "P";
   int ret;
   int err;
@@ -54,8 +55,9 @@ int main(int argc, char* argv[]) {
   struct msqid_ds buf;
   struct msginfo info;
   int i;
-  struct msg msg = { 0 };
   int status;
+  struct msg msg;
+  memset(&msg, 0, sizeof(msg));
 
   breakpoint();
   /* NB: no syscalls between here and |msgget()| below. */
